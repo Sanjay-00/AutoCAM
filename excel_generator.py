@@ -107,9 +107,9 @@ def generate_excel(data: dict) -> bytes:
     ws.title = "CIBIL Summary"
 
     accounts   = data.get("accounts", [])
-    name       = data.get("borrower_name", "Unknown")
-    score      = data.get("cibil_score",   "NA")
-    key_points = data.get("key_points",    [])
+    name       = data.get("name", data.get("borrower_name", "Unknown"))
+    score      = data.get("score", data.get("cibil_score",  "NA"))
+    key_points = data.get("key_points", [])
 
     # ── Set column widths
     for col_idx, (_, width) in enumerate(COLUMNS, 1):
