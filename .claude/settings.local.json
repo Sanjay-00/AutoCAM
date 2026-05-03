@@ -9,7 +9,9 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('parser.py'\\).read\\(\\)\\); print\\('parser.py OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('app.py OK'\\)\")",
       "Bash(python -c ' *)",
-      "Bash(Remove-Item *)"
+      "Bash(Remove-Item *)",
+      "Bash(del *)",
+      "Bash(git checkout *)"
     ]
   }
 }
