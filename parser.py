@@ -292,9 +292,9 @@ def _extract_sanction_amt(block: str) -> int:
 
 def _extract_balance(block: str) -> int:
     val = _next_line_value(block, "Current Balance:")
-    if re.match(r'[\d,]+', val):
+    if re.match(r'-?[\d,]+', val):
         return _to_int(val.split()[0])
-    m = re.search(r'Current\s+Balance[:\s]*([\d,]+)', block, re.IGNORECASE)
+    m = re.search(r'Current\s+Balance[:\s]*(-?[\d,]+)', block, re.IGNORECASE)
     return _to_int(m.group(1)) if m else 0
 
 
