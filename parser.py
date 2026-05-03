@@ -174,18 +174,35 @@ _BLOCK_PATTERNS = [
     re.compile(r'Account\s+Information\s+(\d{1,3})\s*\n', re.MULTILINE),
 ]
 
+# Matches the bare "Account Information\n" header (no dash — excludes
+# Appendix entries like "Account Information - Account #")
+_AI_HEADER = re.compile(r'Account\s+Information\s*\n', re.MULTILINE)
+
+# Confirms a position is inside a real account block (not a summary table)
+_ACCOUNT_FIELD = re.compile(
+    r'Account\s+Type:|Disbursed\s+Date:|Current\s+Balance:|Credit\s+Grantor:',
+    re.IGNORECASE,
+)
+
 
 def split_account_blocks(text: str) -> list:
     """
     Split full PDF text into individual account blocks.
 
-    Runs ALL three patterns simultaneously so mixed-format PDFs are handled
-    correctly — the old OR-logic stopped at the first pattern that found ANY
-    match, silently dropping accounts that used a different format.
+    Two-pass approach:
+      Pass 1  — P1/P2/P3 patterns capture blocks whose account number is
+                present in the text (standard case).
+      Pass 2  — Scans for any 'Account Information' header that was NOT
+                captured in Pass 1.  This handles the HTML-to-PDF page-break
+                case where the browser's print header (timestamp, filename,
+                page number) lands between 'Account Information' and the
+                account number, causing the number to disappear entirely.
+                The missing account number is inferred from its ordinal
+                position between the surrounding numbered accounts.
 
     Returns list of (account_number: int, block_text: str) tuples.
     """
-    # ── Step 1: collect candidates from every pattern ─────────────
+    # ── Pass 1: numbered blocks ───────────────────────────────────
     candidates = []
     for pat in _BLOCK_PATTERNS:
         for m in pat.finditer(text):
@@ -194,16 +211,31 @@ def split_account_blocks(text: str) -> list:
     if not candidates:
         return []
 
-    # ── Step 2: sort, deduplicate hits within 30 chars ────────────
-    # Two patterns can match the same block header at nearly the same
-    # position — keep only the first (leftmost) hit per cluster.
     candidates.sort(key=lambda x: x[0])
     deduped = [candidates[0]]
     for pos, num in candidates[1:]:
         if pos - deduped[-1][0] > 30:
             deduped.append((pos, num))
 
-    # ── Step 3: build blocks ───────────────────────────────────────
+    # ── Pass 2: recover page-break victims (number swallowed by header) ──
+    found_positions = {pos for pos, _ in deduped}
+
+    for m in _AI_HEADER.finditer(text):
+        pos = m.start()
+        # Skip if already captured by Pass 1
+        if any(abs(pos - fp) < 50 for fp in found_positions):
+            continue
+        # Confirm it's a real account block, not an Appendix/Summary entry
+        if not _ACCOUNT_FIELD.search(text[pos: pos + 1000]):
+            continue
+        # Infer account number from position between neighbours
+        prev_nums = [n for p, n in deduped if p < pos]
+        prev_num  = max(prev_nums) if prev_nums else 0
+        deduped.append((pos, prev_num + 1))
+        found_positions.add(pos)
+
+    # ── Build blocks ──────────────────────────────────────────────
+    deduped.sort(key=lambda x: x[0])
     blocks = []
     for i, (start_pos, acct_num) in enumerate(deduped):
         end_pos = deduped[i + 1][0] if i + 1 < len(deduped) else len(text)
