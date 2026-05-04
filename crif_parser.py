@@ -112,10 +112,23 @@ def extract_reported_totals(text: str) -> dict:
 # ─────────────────────────────────────────────────────────────────
 
 _BLOCK_PATTERNS = [
-    re.compile(r'Account\s+Information\s*\n\s*(\d{1,3})\s*\n',    re.MULTILINE),
+    # P1: number on next line      "Account Information\n3\n"
+    re.compile(r'Account\s+Information\s*\n\s*(\d{1,3})\s*\n',     re.MULTILINE),
+    # P2: blank line before number "Account Information\n\n3\n"
     re.compile(r'Account\s+Information\s*\n\s*\n\s*(\d{1,3})\s*\n', re.MULTILINE),
-    re.compile(r'Account\s+Information\s+(\d{1,3})\s*\n',          re.MULTILINE),
+    # P3: number on same line      "Account Information 3\n"
+    re.compile(r'Account\s+Information\s+(\d{1,3})\s*\n',           re.MULTILINE),
+    # P5: number inline with Account Type (HTML-to-PDF format)
+    #     "Account Information\n20  Account Type: ..."
+    re.compile(r'Account\s+Information\s*\n(\d{1,3})\s+Account\s+Type:', re.MULTILINE),
 ]
+
+# P4: number appears on line BEFORE "Account Information\n\nAccount Type:"
+# Requires blank line after header to avoid catching page numbers
+_P4 = re.compile(
+    r'(\d{1,3})\s*\n(Account\s+Information\s*\n\s*\n\s*Account\s+Type:)',
+    re.MULTILINE,
+)
 
 _AI_HEADER    = re.compile(r'Account\s+Information\s*\n', re.MULTILINE)
 _BLOCK_FIELD  = re.compile(
@@ -126,17 +139,25 @@ _BLOCK_FIELD  = re.compile(
 
 def split_account_blocks(text: str) -> list:
     """
-    Two-pass splitter:
-      Pass 1 — P1/P2/P3 patterns (numbered blocks, standard format).
-      Pass 2 — recovers blocks whose number was swallowed by a browser
-               print header on page breaks (HTML-to-PDF); number inferred
-               from ordinal position.
+    Multi-pass splitter handling all known CRIF HTML-to-PDF format variants:
+      P1/P2/P3 — standard numbered blocks (number after header)
+      P4        — number appears on line BEFORE "Account Information" header
+      P5        — number on same line as Account Type after header
+      Pass 2    — page-break recovery (number swallowed by browser header)
     Returns list of (account_number: int, block_text: str).
     """
     candidates = []
+
+    # P1/P2/P3/P5 — block starts at "Account Information"
     for pat in _BLOCK_PATTERNS:
         for m in pat.finditer(text):
             candidates.append((m.start(), int(m.group(1))))
+
+    # P4 — number before header; block starts at "Account Information"
+    for m in _P4.finditer(text):
+        num    = int(m.group(1))
+        ai_pos = m.start(2)   # position of "Account Information"
+        candidates.append((ai_pos, num))
 
     if not candidates:
         return []
