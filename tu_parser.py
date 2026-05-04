@@ -134,21 +134,21 @@ def split_blocks(text: str) -> list:
 def _extract_account(cf_num: int, block: str) -> dict:
     # Sanction amount + EMI (two-column header, values follow)
     m = re.search(
-        r"SANCTIONED INR\s*\nINSTALLMENT AMOUNT\s*\n(₹\s*[\d,]+|-)\s*\n(₹\s*[\d,]+|-)?",
+        r"SANCTIONED INR\s*\nINSTALLMENT AMOUNT\s*\n(₹\s*-?[\d,]+|-)\s*\n(₹\s*-?[\d,]+|-)?",
         block,
     )
     sanction_amt = _parse_inr(m.group(1)) if m else 0
     emi          = _parse_inr(m.group(2)) if (m and m.group(2)) else 0
 
-    # Outstanding balance
+    # Outstanding balance (can be negative — e.g. overpayment)
     m = re.search(
-        r"OUTSTANDING BALANCE\s*\n(?:SUIT FILED\s*\n)?(₹\s*[\d,]+|-)", block
+        r"OUTSTANDING BALANCE\s*\n(?:SUIT FILED\s*\n)?(₹\s*-?[\d,]+|-)", block
     )
     balance = _parse_inr(m.group(1)) if m else 0
 
     # Overdue
     m = re.search(
-        r"OVERDUE\s*\n(?:WRITTEN OFF[:\s]*\n)?(₹\s*[\d,]+|-)", block
+        r"OVERDUE\s*\n(?:WRITTEN OFF[:\s]*\n)?(₹\s*-?[\d,]+|-)", block
     )
     overdue = _parse_inr(m.group(1)) if m else 0
 
