@@ -137,10 +137,7 @@ with col_btn:
 if not (uploaded and run):
     _, meme_col, _ = st.columns([1, 1, 1])
     with meme_col:
-        st.image(
-            r"C:\Users\91748\Desktop\FY Project\CIBIL_EXCEL\abhi thik krke deta hu.jpg",
-            use_container_width=True,
-        )
+        st.image("abhi thik krke deta hu.jpg", use_container_width=True)
     st.stop()
 
 # ── Parse ─────────────────────────────────────────────────────────
