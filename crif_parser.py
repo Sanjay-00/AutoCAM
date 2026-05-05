@@ -280,6 +280,7 @@ def _is_closed(block: str) -> bool:
     Rule 1: Closed Date has a valid date.
     Rule 2: Remarks contains 'Written-off'.
     Rule 3: Compact block — 'Closed' before any field label.
+    Rule 4: Total write-off amount field is non-zero.
     """
     val = _next_line_value(block, "Closed Date:")
     if val and re.match(r'\d{2}-\d{2}-\d{4}', val):
@@ -298,6 +299,13 @@ def _is_closed(block: str) -> bool:
     )
     header_region = block[: first_field.start()] if first_field else block[:300]
     if re.search(r'\nClosed\n', header_region):
+        return True
+
+    wo_m = re.search(
+        r'(?:Total\s+)?Write\s*[- ]?[Oo]ff\s+Amt[:\s]*\n?\s*([\d,]+)',
+        block, re.IGNORECASE,
+    )
+    if wo_m and to_int(wo_m.group(1)) != 0:
         return True
 
     return False

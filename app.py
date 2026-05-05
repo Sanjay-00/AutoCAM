@@ -133,11 +133,7 @@ col_btn, _ = st.columns([1, 4])
 with col_btn:
     run = st.button("🔍  Extract Data", type="primary", use_container_width=True, disabled=not uploaded)
 
-# ── Before extraction: meme ───────────────────────────────────────
 if not (uploaded and run):
-    _, meme_col, _ = st.columns([1, 1, 1])
-    with meme_col:
-        st.image("abhi thik krke deta hu.jpg", use_container_width=True)
     st.stop()
 
 # ── Parse ─────────────────────────────────────────────────────────
