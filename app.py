@@ -204,9 +204,15 @@ tab_all, tab_active, tab_closed = st.tabs([
 with tab_all:
     st.dataframe(_to_df(accounts), column_config=_COL_CFG, use_container_width=True, hide_index=True)
 with tab_active:
-    st.dataframe(_to_df(active),   column_config=_COL_CFG, use_container_width=True, hide_index=True) if active else st.info("No active accounts.")
+    if active:
+        st.dataframe(_to_df(active), column_config=_COL_CFG, use_container_width=True, hide_index=True)
+    else:
+        st.info("No active accounts.")
 with tab_closed:
-    st.dataframe(_to_df(closed),   column_config=_COL_CFG, use_container_width=True, hide_index=True) if closed else st.info("No closed accounts.")
+    if closed:
+        st.dataframe(_to_df(closed), column_config=_COL_CFG, use_container_width=True, hide_index=True)
+    else:
+        st.info("No closed accounts.")
 
 st.divider()
 
