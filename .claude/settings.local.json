@@ -11,7 +11,9 @@
       "Bash(python -c ' *)",
       "Bash(Remove-Item *)",
       "Bash(del *)",
-      "Bash(git checkout *)"
+      "Bash(git checkout *)",
+      "PowerShell(Get-Command *)",
+      "Bash(python parser.py \"C:\\\\Users\\\\91748\\\\Downloads\\\\CIBIL.pdf\")"
     ]
   }
 }
