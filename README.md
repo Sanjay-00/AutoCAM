@@ -44,7 +44,7 @@ Extracts structured loan account data from **CRIF High Mark** and **TransUnion C
 ## Setup
 
 ```bash
-git clone <https://github.com/Sanjay-00/CAMpilot>
+git clone [text](https://github.com/Sanjay-00/CAMpilot.git)
 cd CIBIL_EXCEL
 pip install -r requirements.txt
 streamlit run app.py
