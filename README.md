@@ -8,12 +8,12 @@ Built for Shriram Finance credit analysis workflows.
 
 ## Features
 
-- **Dual-provider support** — handles both CRIF High Mark and TransUnion commercial CIBIL PDFs with automatic detection
-- **Rule-based extraction** — regex-driven parsing that handles 5+ known CRIF PDF layout variants, including HTML-to-PDF page-break edge cases
-- **Self-validating** — compares extracted account counts and balances against the report's own Account Summary / Credit Summary totals
-- **LLM fallback** (CRIF only) — if rule-based extraction fails validation, escalates through Gemini models for block-level correction or full-PDF extraction
-- **Formatted Excel output** — Shriram Finance analyst format with DPD colour coding, Indian number formatting, CIBIL score badge, and a SUMIF-powered active exposure total
-- **Key metrics dashboard** — active/closed account counts, total balance, overdue, max DPD, average active balance, and total exposure
+- **Dual-provider support** - handles both CRIF High Mark and TransUnion commercial CIBIL PDFs with automatic detection
+- **Rule-based extraction** - regex-driven parsing that handles 5+ known CRIF PDF layout variants, including HTML-to-PDF page-break edge cases
+- **Self-validating** - compares extracted account counts and balances against the report's own Account Summary / Credit Summary totals
+- **LLM fallback** (CRIF only) - if rule-based extraction fails validation, escalates through Gemini models for block-level correction or full-PDF extraction
+- **Formatted Excel output** - Shriram Finance analyst format with DPD colour coding, Indian number formatting, CIBIL score badge, and a SUMIF-powered active exposure total
+- **Key metrics dashboard** - active/closed account counts, total balance, overdue, max DPD, average active balance, and total exposure
 
 ---
 
@@ -41,14 +41,14 @@ pip install -r requirements.txt
 
 ### 2. Configure API key (optional)
 
-The Gemini API key is only needed for LLM fallback — the app works without it if rule-based extraction passes validation.
+The Gemini API key is only needed for LLM fallback, the app works without it if rule-based extraction passes validation.
 
-**Local development** — create a `.env` file:
+**Local development** - create a `.env` file:
 ```
 GEMINI_API_KEY=your_key_here
 ```
 
-**Streamlit Cloud deployment** — add to `.streamlit/secrets.toml`:
+**Streamlit Cloud deployment** - add to `.streamlit/secrets.toml`:
 ```toml
 GEMINI_API_KEY = "your_key_here"
 ```
