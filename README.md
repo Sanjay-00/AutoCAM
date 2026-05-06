@@ -1,8 +1,8 @@
-# AutoCAM — CIBIL Report Analyser
+# AutoCAM - CIBIL Report Analyser
 
 Extracts structured loan account data from **CRIF High Mark** and **TransUnion CIBIL** PDFs and generates a formatted Excel file for credit analysts at Shriram Finance.
 
-**Live demo → [autocam-cibil.streamlit.app](https://autocam-cibil.streamlit.app/)**
+**Live demo - [autocam-cibil.streamlit.app](https://autocam-cibil.streamlit.app/)**
 
 ---
 
@@ -21,7 +21,7 @@ Extracts structured loan account data from **CRIF High Mark** and **TransUnion C
 
 ![Upload UI](assets/ui_upload.png)
 
-**After extraction — metrics dashboard**
+**After extraction - metrics dashboard**
 
 ![Metrics](assets/ui_metrics.png)
 
@@ -44,20 +44,20 @@ Extracts structured loan account data from **CRIF High Mark** and **TransUnion C
 ## Setup
 
 ```bash
-git clone <repo-url>
+git clone <https://github.com/Sanjay-00/CAMpilot>
 cd CIBIL_EXCEL
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-**API key** (optional — only needed if LLM fallback is required):
+**API key** (optional - only needed if LLM fallback is required):
 
 ```
 # .env
 GEMINI_API_KEY=your_key_here
 ```
 
-For Streamlit Cloud, add it under **Settings → Secrets**.
+For Streamlit Cloud, add it under **Settings - Secrets**.
 
 ---
 
@@ -69,8 +69,7 @@ Streamlit · PyMuPDF · openpyxl · LangChain + Google Gemini · pandas
 
 ## Future Work
 
-- **LLM-powered CIBIL analysis** — automated credit risk commentary and key observations generated from extracted account data using an LLM
-- TransUnion LLM fallback support
+- **LLM-powered CIBIL analysis** - automated credit risk commentary and key observations generated from extracted account data using an LLM
 - Support for scanned/image-based PDFs via OCR
 - Multi-borrower batch processing
 
@@ -78,5 +77,5 @@ Streamlit · PyMuPDF · openpyxl · LangChain + Google Gemini · pandas
 
 ## Limitations
 
-- Scanned (image-based) PDFs are not supported — only digital CIBIL reports with extractable text
-- TransUnion reports have no LLM fallback
+- Scanned (image-based) PDFs are not supported - only digital CIBIL reports with extractable text
+- Only works with 2 specific format - CRIF and TransUnion
