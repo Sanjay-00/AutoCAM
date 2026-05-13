@@ -37,7 +37,13 @@ def extract_text(pdf_source) -> str:
     pages = [page.get_text() for page in doc]
     doc.close()
     text = "\n".join(pages)
-    return text.replace("\xa0", " ").replace("–", "-").replace("—", "-")
+    text = text.replace("\xa0", " ").replace("–", "-").replace("—", "-")
+    if len(text.strip()) < 100:
+        raise ValueError(
+            "This PDF appears to be scanned (image-based) and contains no extractable text. "
+            "Please upload a digital CIBIL report."
+        )
+    return text
 
 
 # ─────────────────────────────────────────────────────────────────
