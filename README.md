@@ -15,7 +15,8 @@ AutoCAM eliminates this manual effort entirely.
 Upload a CIBIL PDF and get a structured, formatted Excel file in seconds.
 
 - Extracts all loan accounts automatically (active and closed)
-- Covers both **CRIF High Mark** and **TransUnion CIBIL** report formats
+- Covers **CRIF High Mark** (retail + Commercial ACE), and **TransUnion CIBIL** report formats
+- Reads **scanned / image-based** reports too, via OCR (Tesseract) with a Gemini Vision fallback
 - Validates extracted data against the report's own summary totals
 - Outputs an Excel file in the exact format required for the CAM
 - Filter by Active / Closed accounts directly in the app or excel
@@ -53,20 +54,32 @@ Upload a CIBIL PDF and get a structured, formatted Excel file in seconds.
 3. Review the dashboard - borrower name, CIBIL score, account metrics
 4. Download the pre-formatted Excel file ready for the CAM
 
-If rule-based extraction doesn't pass validation, the app automatically falls back to a Gemini LLM for correction, without any action needed from the user.
-
+If rule-based extraction doesn't pass validation, the app automatically falls back to a Gemini LLM for correction, without any action needed from the user. Scanned reports are OCR'd with Tesseract first, and fall back to Gemini Vision (on the relevant pages only) when the OCR'd parse doesn't reconcile with the report totals.
 
 ## Tech Stack
 
-Streamlit · PyMuPDF · openpyxl · LangChain + Google Gemini · pandas
+Streamlit · PyMuPDF · Tesseract / pytesseract · openpyxl · LangChain + Google Gemini (text + vision) · pandas
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+OCR of scanned reports needs the **Tesseract** engine installed:
+
+- **Windows**: install the [UB Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki). The app auto-detects `C:\Program Files\Tesseract-OCR\tesseract.exe`; for a custom path set the `TESSERACT_CMD` environment variable.
+- **Linux / Streamlit Cloud**: handled automatically via `packages.txt` (`tesseract-ocr`).
+
+The Gemini API key is read from `.env` (`GEMINI_API_KEY=...`) locally or Streamlit Secrets when deployed.
 
 ## Future Work
 
 - **LLM-powered credit analysis**: auto-generate risk observations and key points from the extracted CIBIL data
-- Support for scanned/image-based PDFs via OCR
 - Multi-borrower batch processing
 
 ## Limitations
 
-- Scanned (image-based) PDFs are not supported, only digital CIBIL reports with extractable text
+- OCR of a large scanned report (100+ pages) takes a few minutes
 - TransUnion reports have no LLM fallback

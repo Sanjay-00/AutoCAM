@@ -22,6 +22,11 @@ def to_int(s) -> int:
 # ─────────────────────────────────────────────────────────────────
 
 def extract_name(text: str) -> str:
+    # PROV2: "Name: FULLNAME  DOB/Age: ..." (Inquiry Input Information section)
+    m = re.search(r'\bName:\s+([A-Z][A-Z ]+?)\s+(?:DOB|Age|Gender)\b', text)
+    if m:
+        return re.sub(r'\s{2,}', ' ', m.group(1)).strip()
+    # CRIF retail: "For NAME\n" or "For NAME CHM/Application/Credit"
     m = (
         re.search(r'For\s+([A-Z][A-Z\s]+?)\s*\n', text)
         or re.search(r'For\s+([A-Z][A-Z\s]+?)\s+(?:CHM|Application|Credit)', text)
@@ -38,20 +43,24 @@ def extract_name(text: str) -> str:
 
 
 def extract_score(text: str):
+    # Primary: score digit appears right after "300-900" on the same line
     m = re.search(r'300-900\s*\n?\s*(\d{3})\b', text)
     if m:
-        try:
-            return int(m.group(1))
-        except ValueError:
-            pass
+        v = int(m.group(1))
+        if 300 <= v <= 900:
+            return v
+    # PROV2 fallback: "CB SCORE Enquired Entity exists in bureau 716" (Verification section)
+    m = re.search(r'CB\s+SCORE[^\n]+\b(\d{3})\b', text, re.IGNORECASE)
+    if m:
+        v = int(m.group(1))
+        if 300 <= v <= 900:
+            return v
+    # Last resort: any PERFORM line with a 3-digit value in range
     m = re.search(r'PERFORM[^\n]*?(\d{3})\b', text)
     if m:
-        try:
-            v = int(m.group(1))
-            if 300 <= v <= 900:
-                return v
-        except ValueError:
-            pass
+        v = int(m.group(1))
+        if 300 <= v <= 900:
+            return v
     return "NA"
 
 
@@ -104,6 +113,27 @@ def extract_reported_totals(text: str) -> dict:
             totals["total_balance"] = to_int(m.group(1))
             break
 
+    # PROV2 Account Summary columns:
+    #   Number of Accounts | Active | Overdue | Secured | UnSecured | Untagged | Amounts...
+    # Active is at index 1; Secured + UnSecured == Total (sanity check). The first
+    # comma-amount on the same row is Total Current Balance (the remaining amounts
+    # are its secured/unsecured split, disbursed, sanctioned, overdue).
+    if totals["account_count"] is None:
+        group_m   = re.search(r'Group\s+Account\s+Summary', section, re.IGNORECASE)
+        main_part = section[: group_m.start()] if group_m else section
+        for line in main_part.split('\n'):
+            # Match standalone 1-3 digit numbers (exclude digits inside large comma amounts)
+            small = [int(v) for v in re.findall(r'(?<![,\d])(\d{1,3})(?![,\d])', line)
+                     if int(v) < 500]
+            if len(small) >= 5:
+                total, active, _, secured, unsecured = small[:5]
+                if secured + unsecured == total and 0 < total < 500:
+                    totals["account_count"] = active
+                    amounts = re.findall(r'\d{1,3}(?:,\d{2,3})+', line)
+                    if amounts:
+                        totals["total_balance"] = to_int(amounts[0])
+                    break
+
     return totals
 
 
@@ -130,9 +160,14 @@ _P4 = re.compile(
     re.MULTILINE,
 )
 
-_AI_HEADER    = re.compile(r'Account\s+Information\s*\n', re.MULTILINE)
+# OCR sometimes corrupts the word "Account" in the block header — dropping the
+# leading 'A' ("ccount Information") or splitting it ("Acco unt Information").
+# Tolerate both so no account block is lost. The trailing \n keeps the appendix
+# rows ("Account Information - Credit Grantor ...") from matching.
+_AI_HEADER    = re.compile(r'A?cco\s?unt\s+Information\s*\n', re.MULTILINE)
 _BLOCK_FIELD  = re.compile(
-    r'Account\s+Type:|Disbursed\s+Date:|Current\s+Balance:|Credit\s+Grantor:',
+    r'Account\s+Type:|Disbursed\s+Date:|Current\s+Balance:|Credit\s+Grantor:'
+    r'|\d{2}-\d{2}-\d{4}',   # DD-MM-YYYY date present in every real account block
     re.IGNORECASE,
 )
 
@@ -159,16 +194,17 @@ def split_account_blocks(text: str) -> list:
         ai_pos = m.start(2)   # position of "Account Information"
         candidates.append((ai_pos, num))
 
-    if not candidates:
-        return []
-
-    candidates.sort(key=lambda x: x[0])
-    deduped = [candidates[0]]
-    for pos, num in candidates[1:]:
-        if pos - deduped[-1][0] > 30:
-            deduped.append((pos, num))
-
-    found_positions = {pos for pos, _ in deduped}
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        deduped = [candidates[0]]
+        for pos, num in candidates[1:]:
+            if pos - deduped[-1][0] > 30:
+                deduped.append((pos, num))
+        found_positions = {pos for pos, _ in deduped}
+    else:
+        # No P1-P5 match (e.g. PROV2 OCR where number/Account Type line is garbled).
+        # Fall through to Pass 2 which discovers blocks by field presence alone.
+        deduped, found_positions = [], set()
     for m in _AI_HEADER.finditer(text):
         pos = m.start()
         if any(abs(pos - fp) < 50 for fp in found_positions):
@@ -198,15 +234,35 @@ def _next_line_value(block: str, label: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+_DATE_RE      = re.compile(r'\d{2}-\d{2}-\d{4}')
+# Dates that are NOT the disbursed date — exclude them in the fallback scan.
+_DATE_EXCLUDE = re.compile(
+    r'(?:Ason|Last\s+Payment\s+Date|Closed\s+Date|Last\s+Reported|as\s+of)\s*[:.]?\s*$',
+    re.IGNORECASE,
+)
+
+
 def _extract_date(block: str) -> str:
     val = _next_line_value(block, "Disbursed Date:")
     if re.match(r'\d{2}-\d{2}-\d{4}', val):
-        return val
+        return val[:10]
     m = re.search(r'Disbursed\s+Date[:\s]+(\d{2}-\d{2}-\d{4})', block)
     if m:
         return m.group(1)
     m = re.search(r'Date\s+of\s+Sanction[:\s]+(\d{2}[-/]\d{2}[-/]\d{4})', block, re.IGNORECASE)
-    return m.group(1).replace("/", "-") if m else "NA"
+    if m:
+        return m.group(1).replace("/", "-")
+    # Fallback: row reconstruction sometimes splits the disbursed date onto the
+    # line above its label (e.g. it lands on the Ownership row). Take the earliest
+    # date in the block that isn't an Ason / Last-Payment / Closed / Reported date
+    # — disbursement is the origination event, so it's the oldest.
+    cands = []
+    for dm in _DATE_RE.finditer(block):
+        if not _DATE_EXCLUDE.search(block[max(0, dm.start() - 22): dm.start()]):
+            cands.append(dm.group(0))
+    if cands:
+        return min(cands, key=lambda d: (d[6:10], d[3:5], d[0:2]))
+    return "NA"
 
 
 def _extract_sanction_amt(block: str) -> int:
@@ -242,35 +298,125 @@ def _extract_emi(block: str) -> int:
     return to_int(m.group(1)) if m else 0
 
 
+# Words that mark the end of a Credit Grantor value (the next column's label).
+_ENTITY_STOP = re.compile(
+    r'\b(?:Account|Lender|Ason|Disbursed|Disbd|Ownership|Type|Last|Closed|Cash)\b',
+    re.IGNORECASE,
+)
+
+
+# Words that signal a genuine lender name (so a lone token like "SBI" survives).
+_LENDER_KW = re.compile(
+    r'BANK|FINANC|LIMITED|\bLTD\b|\bHFC\b|NBFC|HOUSING|CORP|CREDIT\s+CO|'
+    r'SOCIET|FINSERV|CAPITAL|MAHINDRA|BAJAJ|MUTHOOT|MANNAPURAM',
+    re.IGNORECASE,
+)
+
+
+def _is_masked_entity(val: str) -> bool:
+    """
+    Masked/undisclosed or garbage grantor → treat as NA. Real lender names have no
+    digits, aren't 'XXXX', aren't a bled-in loan type, and are either multi-word or
+    carry a lender keyword (so 'FED'-style OCR noise is rejected but 'HDFC BANK' is
+    kept).
+    """
+    if not val:
+        return True
+    if re.search(r'\d', val):                      # real lender names carry no digits
+        return True
+    if re.search(r'X{2,}', val, re.IGNORECASE):
+        return True
+    upper = val.upper()
+    if ('LOAN' in upper or 'OVERDRAFT' in upper or 'CREDIT CARD' in upper) \
+            and not _LENDER_KW.search(val):        # a loan type bled into the column
+        return True
+    if len(re.findall(r'[A-Za-z]{2,}', val)) >= 2:
+        return False
+    return not _LENDER_KW.search(val)              # lone token: keep only if a lender word
+
+
 def _extract_entity(block: str) -> str:
-    val = _next_line_value(block, "Credit Grantor:")
-    if not val or val.upper().startswith("XXXX"):
-        m = re.search(r'Credit\s+Grantor[:\s]+([^\n\t]+)', block)
-        val = m.group(1).strip() if m else ""
-    if val and not val.upper().startswith("XXXX"):
-        for stop in ("Account #", "Lender Type", "Account Type"):
-            if stop in val:
-                val = val[: val.index(stop)].strip()
-        return val or "Not Disclosed"
-    return "Not Disclosed"
+    """
+    Read the account's OWN Credit Grantor (per-block — positional lists misalign).
+    OCR writes the label as 'Credit Grantor:' / 'Grantor.' / 'Grantor', often with
+    the value inline and the next column bleeding in. Masked grantors → 'NA'.
+    """
+    m = re.search(r'Credit\s+Grantor\s*[:.\-=]?\s*([^\n]*)', block, re.IGNORECASE)
+    if not m:
+        return "NA"
+    val = m.group(1)
+    stop = _ENTITY_STOP.search(val)
+    if stop:
+        val = val[: stop.start()]
+    val = val.strip(" .:'`-*‘’�\t")
+    return "NA" if _is_masked_entity(val) else val
+
+
+# Canonical CRIF loan types, longest/most-specific first so greedy matching wins.
+_LOAN_TYPES = [
+    "CONSTRUCTION EQUIPMENT LOAN", "COMMERCIAL VEHICLE LOAN",
+    "BUSINESS LOAN UNSECURED", "BUSINESS LOAN SECURED", "LOAN AGAINST PROPERTY",
+    "AUTO LOAN (PERSONAL)", "KISAN CREDIT CARD", "TWO-WHEELER LOAN",
+    "USED CAR LOAN", "CONSUMER LOAN", "PROPERTY LOAN", "PERSONAL LOAN",
+    "HOUSING LOAN", "HOME LOAN", "TRACTOR LOAN", "EDUCATION LOAN", "GOLD LOAN",
+    "OVERDRAFT", "BUSINESS LOAN", "AUTO LOAN", "CREDIT CARD",
+]
+
+
+def _squash(s: str) -> str:
+    return re.sub(r'[^A-Z0-9]', '', s.upper())
+
+
+_LOAN_SQUASHED = [(t, _squash(t)) for t in _LOAN_TYPES]
 
 
 def _extract_loan_type(block: str) -> str:
-    val = _next_line_value(block, "Account Type:")
-    if not val:
-        m = re.search(r'Account\s+Type[:\s]+([^\n\t]+)', block)
-        val = m.group(1).strip() if m else ""
-    for stop in ("Credit Grantor", "Account #", "Lender Type"):
-        if stop in val:
-            val = val[: val.index(stop)].strip()
-    return val or "Unknown"
+    """
+    Match the account type against the known CRIF vocabulary, comparing on a
+    punctuation/whitespace-stripped form so OCR noise (hyphens, parens, split
+    words, two-row label/value layout) doesn't break it. Falls back to the inline
+    'Account Type:' value, else 'Unknown'.
+    """
+    head = block.split("Payment History")[0][:600]
+    sq   = _squash(head)
+    for canon, csq in _LOAN_SQUASHED:
+        if csq in sq:
+            return canon
+    m = re.search(r'Account\s+Type\s*[:.\-=]?\s*([^\n]*)', head, re.IGNORECASE)
+    if m:
+        val = m.group(1)
+        for stop in ("Credit Grantor", "Account #", "Lender Type", "Credit", "Account", "Ason"):
+            i = val.find(stop)
+            if i > 0:
+                val = val[:i]
+        val = val.strip(" .:'`-*�\t")
+        # Reject label residue that leaked in (e.g. 'Credit Grantor: #') and require
+        # a real word.
+        if re.search(r'[A-Za-z]{3,}', val) and not re.search(
+                r'Grantor|Lender|Credit|Account|#', val, re.IGNORECASE):
+            return val
+    return "Unknown"
+
+
+# Frequency abbreviations that look like an asset class after a '/'. They come from
+# the EMI field (e.g. '2,31,400/Monthly') and must NOT be read as DPD cells.
+_DPD_FREQ = {"MON", "ANN", "MTH", "WK", "QTR", "QUA", "WEE", "HAL", "FOR", "BIM"}
 
 
 def _extract_max_dpd(block: str) -> int:
-    vals = [
-        int(m.group(1))
-        for m in re.finditer(r'(\d{3})/(?:XXX|STD|SMA|SUB|DBT|LOS)', block)
-        if int(m.group(1)) < 998
+    # DPD grid cells are "NNN/AssetClass" (e.g. 027/XXX). OCR mangles them two ways:
+    #   - the days value loses leading zeros, so it can be 1-3 digits ('24/XXX');
+    #   - the asset class is mis-read ('027/KXX' for '027/XXX'), so requiring an exact
+    #     class silently dropped the cell.
+    # Accept a 2-3 LETTER class (covers XXX/STD/SMA/... and garbles like KXX) but
+    # reject digit-only tokens ('200/200') and frequency words ('400/Monthly'), which
+    # would otherwise fabricate DPD from EMI amounts and '000'→'200' misreads.
+    m      = re.search(r'Payment\s+History', block, re.IGNORECASE)
+    region = block[m.end():] if m else block
+    vals   = [
+        int(num)
+        for num, cls in re.findall(r'(?<!\d)(\d{1,3})\s*/\s*([A-Za-z]{2,3})', region)
+        if cls.upper() not in _DPD_FREQ and int(num) < 900
     ]
     return max(vals) if vals else 0
 
@@ -367,17 +513,18 @@ def extract_account(acct_num: int, block: str,
 
 def parse_crif(text: str) -> tuple:
     """Returns (name, score, blocks, accounts, reported_totals)."""
+    # The OCR layer injects commercial status-strip markers on every scanned page;
+    # the retail path doesn't use them, so drop them before they can bleed into fields.
+    text     = re.sub(r'__STATUS_(?:ACTIVE|CLOSED)__', '', text)
     name     = extract_name(text)
     score    = extract_score(text)
     reported = extract_reported_totals(text)
     blocks   = split_account_blocks(text)
 
-    at_list, cg_list = build_positional_lists(text)
-    accounts = []
-    for idx, (num, blk) in enumerate(blocks):
-        loan_type = at_list[idx] if idx < len(at_list) else None
-        entity    = cg_list[idx] if idx < len(cg_list) else None
-        accounts.append(extract_account(num, blk, loan_type, entity))
-
+    # Per-block extraction for entity and loan type. The old positional lists
+    # (build_positional_lists) mapped the Nth summary label to the Nth block, which
+    # misaligns badly once any label count drifts under OCR (e.g. 34 blocks vs 13/23
+    # labels). Geometry-reconstructed blocks now carry their own clean labels.
+    accounts = [extract_account(num, blk) for num, blk in blocks]
     accounts.sort(key=lambda x: x["sr_no"])
     return name, score, blocks, accounts, reported

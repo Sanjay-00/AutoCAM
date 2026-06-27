@@ -6,7 +6,10 @@ CRIF High Mark PDF → Structured Excel
 import os
 import pandas as pd
 import streamlit as st
-from parser import parse, METHOD_RULE_BASED, METHOD_LLM_CORRECTION, METHOD_LLM_FULL
+from parser import (
+    parse, METHOD_RULE_BASED, METHOD_LLM_CORRECTION, METHOD_LLM_FULL,
+    METHOD_OCR, METHOD_VISION,
+)
 from excel_generator import generate_excel, get_filename
 
 st.set_page_config(
@@ -75,21 +78,46 @@ def _score_badge(score):
 
 
 def _method_badge(method):
-    cfg   = {METHOD_RULE_BASED: st.success, METHOD_LLM_CORRECTION: st.warning, METHOD_LLM_FULL: st.error}
-    icons = {METHOD_RULE_BASED: "✅", METHOD_LLM_CORRECTION: "⚠️", METHOD_LLM_FULL: "🤖"}
+    cfg = {
+        METHOD_RULE_BASED:     st.success, METHOD_LLM_CORRECTION: st.warning,
+        METHOD_LLM_FULL:       st.error,   METHOD_OCR:            st.warning,
+        METHOD_VISION:         st.info,
+    }
+    icons = {
+        METHOD_RULE_BASED: "✅", METHOD_LLM_CORRECTION: "⚠️", METHOD_LLM_FULL: "🤖",
+        METHOD_OCR:        "📄", METHOD_VISION:         "👁️",
+    }
     cfg.get(method, st.info)(f"{icons.get(method, 'ℹ️')}  {method}")
 
 
 def _validation_badge(v):
-    if v.get("expected_count") is None and v.get("expected_balance") is None:
-        st.info("ℹ️  Validation: Account Summary section not found in this PDF")
+    exp_c, exp_b = v.get("expected_count"), v.get("expected_balance")
+    if exp_c is None and exp_b is None:
+        st.info("ℹ️  Validation: summary section not found in this PDF")
         return
-    if v["valid"]:
-        bal = (f"  ·  Balance {_fmt_inr(v['extracted_balance'])} / {_fmt_inr(v['expected_balance'])}"
-               if v.get("expected_balance") else "")
-        st.success(f"✅  Validation passed  ·  Active {v['extracted_count']} / {v['expected_count']}{bal}")
+
+    # Current balance is the authoritative check; active count is secondary (the
+    # bureau itself sometimes mislabels active/closed, and a misclassified
+    # zero-balance account doesn't move the balance total).
+    bal_ok = (not exp_b) or abs((v.get("extracted_balance") or 0) - exp_b) <= max(exp_b * 0.05, 1000)
+    cnt_ok = (exp_c is None) or (v.get("extracted_count") == exp_c)
+
+    lines = []
+    if exp_b:
+        lines.append(f"{'✅' if bal_ok else '❌'}  Current balance: "
+                     f"{_fmt_inr(v['extracted_balance'])} / {_fmt_inr(exp_b)} (summary)")
+    if exp_c is not None:
+        lines.append(f"{'✅' if cnt_ok else '⚠️'}  Active accounts: "
+                     f"{v.get('extracted_count')} / {exp_c} (summary)")
+    body = "\n\n".join(lines)
+
+    if bal_ok and cnt_ok:
+        st.success("✅  Validation passed\n\n" + body)
+    elif bal_ok:
+        st.warning("⚠️  Balance matches the summary, but the active count differs — "
+                   "often a bureau active/closed labelling difference. Please review.\n\n" + body)
     else:
-        st.warning("⚠️  Validation mismatch\n\n" + "\n\n".join(f"• {i}" for i in v["issues"]))
+        st.error("❌  Balance does not match the summary — review the extraction.\n\n" + body)
 
 
 def _to_df(accounts: list) -> pd.DataFrame:
@@ -137,14 +165,31 @@ if not (uploaded and run):
     st.stop()
 
 # ── Parse ─────────────────────────────────────────────────────────
-with st.spinner("Reading PDF and extracting accounts…"):
-    try:
-        data = parse(uploaded, api_key=_load_api_key())
-    except Exception as e:
-        st.error(f"Parsing failed: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-        st.stop()
+_progress_bar  = st.progress(0, text="Reading PDF…")
+_status_text   = st.empty()
+
+
+def _on_ocr_progress(current: int, total: int):
+    pct = int(current / total * 100)
+    _progress_bar.progress(pct, text=f"Scanning page {current} of {total}…")
+    _status_text.caption(
+        f"OCR in progress · {current}/{total} pages done"
+        + (" — this takes a few minutes for large scanned reports" if current == 1 else "")
+    )
+
+
+try:
+    data = parse(uploaded, api_key=_load_api_key(), on_progress=_on_ocr_progress)
+except Exception as e:
+    _progress_bar.empty()
+    _status_text.empty()
+    st.error(f"Parsing failed: {e}")
+    import traceback
+    st.code(traceback.format_exc())
+    st.stop()
+
+_progress_bar.empty()
+_status_text.empty()
 
 accounts = data["accounts"]
 active   = [a for a in accounts if a["status"] == "Active"]
@@ -213,6 +258,13 @@ with tab_closed:
         st.dataframe(_to_df(closed), column_config=_COL_CFG, use_container_width=True, hide_index=True)
     else:
         st.info("No closed accounts.")
+
+if data["extraction_method"] == METHOD_OCR:
+    st.caption(
+        "ℹ️ **Max DPD is approximate** on scanned reports — the dense payment-history "
+        "grid has tiny digits that OCR can misread. Verify against the PDF for any "
+        "delinquent (non-zero DPD) account before relying on it."
+    )
 
 st.divider()
 
