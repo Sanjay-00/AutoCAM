@@ -1,5 +1,5 @@
 """
-tu_parser.py — TransUnion CIBIL parser (commercial / company reports)
+tu_parser.py  -  TransUnion CIBIL parser (commercial / company reports)
 Rule-based extraction for Credit Facility blocks.
 """
 
@@ -140,7 +140,7 @@ def _extract_account(cf_num: int, block: str) -> dict:
     sanction_amt = _parse_inr(m.group(1)) if m else 0
     emi          = _parse_inr(m.group(2)) if (m and m.group(2)) else 0
 
-    # Outstanding balance (can be negative — e.g. overpayment)
+    # Outstanding balance (can be negative  -  e.g. overpayment)
     m = re.search(
         r"OUTSTANDING BALANCE\s*\n(?:SUIT FILED\s*\n)?(₹\s*-?[\d,]+|-)", block
     )
