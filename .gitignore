@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 cibil/
 CLAUDE.md
+*.stackdump
+bash.exe.stackdump
+learning/
