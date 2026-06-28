@@ -475,14 +475,12 @@ def build_positional_lists(text: str) -> tuple:
     cg_re   = re.compile(r'Credit Grantor:\s*\n?\s*(.+?)(?:\n|$)', re.MULTILINE)
     cg_list = []
     for m in cg_re.finditer(text):
-        raw = m.group(1).strip()
-        for stop in ("Account #", "Lender Type"):
-            if stop in raw:
-                raw = raw[:raw.index(stop)].strip()
-        entity = raw.strip()
-        if entity.upper().startswith("XXXX") or entity == "":
-            entity = "Not Disclosed"
-        cg_list.append(entity)
+        raw  = m.group(1)
+        stop = _ENTITY_STOP.search(raw)
+        if stop:
+            raw = raw[: stop.start()]
+        entity = raw.strip(" .:'`-*‘’�\t")
+        cg_list.append("NA" if _is_masked_entity(entity) else entity)
 
     return at_list, cg_list
 
@@ -521,10 +519,25 @@ def parse_crif(text: str) -> tuple:
     reported = extract_reported_totals(text)
     blocks   = split_account_blocks(text)
 
-    # Per-block extraction for entity and loan type. The old positional lists
-    # (build_positional_lists) mapped the Nth summary label to the Nth block, which
-    # misaligns badly once any label count drifts under OCR (e.g. 34 blocks vs 13/23
-    # labels). Geometry-reconstructed blocks now carry their own clean labels.
-    accounts = [extract_account(num, blk) for num, blk in blocks]
+    # Entity & loan type: hybrid source. The compact summary's positional lists are
+    # the authoritative, clean source — but ONLY when they align 1:1 with the blocks
+    # (true for digital/clean text). Under OCR garble the label count drifts (e.g. 34
+    # blocks vs 13 labels), so there we fall back to per-block extraction. Some CRIF
+    # variants don't even print Account Type in the detail block (only in the
+    # summary), so the positional list is essential for those.
+    at_list, cg_list = build_positional_lists(text)
+    at_ok = len(at_list) == len(blocks)
+    cg_ok = len(cg_list) == len(blocks)
+
+    accounts = []
+    for idx, (num, blk) in enumerate(blocks):
+        lt = at_list[idx] if at_ok else None
+        en = cg_list[idx] if cg_ok else None
+        if not lt or lt == "Unknown":
+            lt = _extract_loan_type(blk)
+        if not en or en == "NA":
+            en = _extract_entity(blk)
+        accounts.append(extract_account(num, blk, lt, en))
+
     accounts.sort(key=lambda x: x["sr_no"])
     return name, score, blocks, accounts, reported

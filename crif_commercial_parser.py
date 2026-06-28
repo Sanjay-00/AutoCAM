@@ -170,19 +170,30 @@ def extract_reported_totals(text: str) -> dict:
 # ACCOUNT BLOCK SPLITTING
 # ─────────────────────────────────────────────────────────────────
 
-# OCR sometimes drops the leading "Loan" glyph, leaving just "Terms For:".
-# Require the trailing colon so we don't match stray "terms for" prose.
+# Each account header reads: "Loan Terms For: Applicant as Borrower  Info. as of: <date>".
+# OCR sometimes garbles "Terms For" but leaves "Info. as of" intact (or vice-versa),
+# so we anchor on EITHER token. Require the trailing colon so we don't match prose.
 _BLOCK_MARKER = re.compile(r'(?:Loan\s+)?Terms\s+For\s*:', re.IGNORECASE)
+_INFO_MARKER  = re.compile(r'Info\.?\s*as\s*of\s*:',       re.IGNORECASE)
+_HEADER_DEDUP = 120   # Terms-For and Info-as-of co-occur within ~40 chars on one line
 
 
 def split_account_blocks(text: str) -> list:
     """
-    Each detailed account ('Account Trade History') begins at 'Loan Terms For'.
+    Each detailed account ('Account Trade History') begins at its header line.
+    Anchor on 'Loan Terms For' OR 'Info. as of' (whichever OCR preserved) and
+    de-duplicate the two tokens that share a single header line. This recovers
+    accounts whose 'Terms For' header was mangled by OCR (e.g. on long reports).
     Returns list of (ordinal: int, block_text: str).
     """
-    starts = [m.start() for m in _BLOCK_MARKER.finditer(text)]
-    if not starts:
+    cands = sorted([m.start() for m in _BLOCK_MARKER.finditer(text)]
+                   + [m.start() for m in _INFO_MARKER.finditer(text)])
+    if not cands:
         return []
+    starts = [cands[0]]
+    for p in cands[1:]:
+        if p - starts[-1] > _HEADER_DEDUP:
+            starts.append(p)
     blocks = []
     for i, start in enumerate(starts):
         end = starts[i + 1] if i + 1 < len(starts) else len(text)
