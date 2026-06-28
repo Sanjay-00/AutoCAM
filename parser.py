@@ -1,5 +1,5 @@
 """
-parser.py — AutoCAM CIBIL orchestrator
+parser.py  -  AutoCAM CIBIL orchestrator
 
 Detects provider → routes to crif_parser or tu_parser → validates →
 LLM fallback (CRIF only) on mismatch.
@@ -41,7 +41,7 @@ def _open_doc(pdf_source) -> "fitz.Document":
 
 
 def _normalize_text(text: str) -> str:
-    return text.replace("\xa0", " ").replace("–", "-").replace("—", "-")
+    return text.replace("\xa0", " ").replace("\u2013", "-").replace("\u2014", "-")
 
 
 def _extract(doc, on_progress=None) -> tuple:
@@ -64,7 +64,7 @@ def _extract(doc, on_progress=None) -> tuple:
 
 
 def extract_text(pdf_source) -> str:
-    """Public helper — returns report text (OCR'd if the PDF is scanned)."""
+    """Public helper  -  returns report text (OCR'd if the PDF is scanned)."""
     doc = _open_doc(pdf_source)
     try:
         return _extract(doc)[0]
@@ -202,7 +202,7 @@ def _normalize(accounts: list) -> list:
 
 def _llm_fix_blocks(blocks: list, current: list, api_key: str) -> tuple:
     import json
-    blocks_text = "\n\n---ACCOUNT---\n\n".join(
+    blocks_text = "\n\n__ACCOUNT__\n\n".join(
         f"ACCOUNT {num}:\n{blk[:1800]}" for num, blk in blocks
     )
     prompt = (
@@ -277,7 +277,7 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key) -> dict:
     """
     CRIF Commercial ACE path. Rule-based on the (possibly OCR'd) text; when the
     source was scanned and the parse fails the report's summary validation, fall
-    back to Gemini Vision on the targeted account pages — but only adopt the
+    back to Gemini Vision on the targeted account pages  -  but only adopt the
     Vision result if it validates at least as well as the OCR result.
     """
     name, score, blocks, accounts, reported = parse_crif_commercial(text)
@@ -402,7 +402,7 @@ def debug_blocks(pdf_path: str) -> None:
         print()
 
     all_raw = re.findall(r'Account\s+Information[\s\S]{0,60}', text)
-    print(f"--- All 'Account Information' occurrences ({len(all_raw)}) ---")
+    print(f"All 'Account Information' occurrences ({len(all_raw)})")
     for hit in all_raw:
         print(f"  {hit.replace(chr(10), '↵ ')[:80]}")
 

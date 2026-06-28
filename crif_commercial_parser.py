@@ -1,5 +1,5 @@
 """
-crif_commercial_parser.py — CRIF High Mark "COMMERCIAL ACE REPORT" parser.
+crif_commercial_parser.py  -  CRIF High Mark "COMMERCIAL ACE REPORT" parser.
 
 A third provider format (distinct from CRIF Retail/MSME and TransUnion). Unlike the
 retail report, fields sit in a 3-column grid, so a single text line typically carries
@@ -58,7 +58,7 @@ _RISK_RANK = {
 
 def extract_score(text: str):
     """
-    CRIF Commercial isn't a 300-900 score — it's a PERFORM COMMERCIAL risk RANK
+    CRIF Commercial isn't a 300-900 score  -  it's a PERFORM COMMERCIAL risk RANK
     from 1 (best) to 5 (worst), printed as a grade letter + label, e.g.
     'PERFORM COMMERCIAL 2.0 ... J-High Risk'. We key on the risk LABEL (robust)
     rather than the OCR-fragile single grade letter, and return 'N (Label)'.
@@ -83,7 +83,7 @@ def extract_score(text: str):
 
 
 # ─────────────────────────────────────────────────────────────────
-# VALIDATION TOTALS  (Borrower Summary — amounts in Crores)
+# VALIDATION TOTALS  (Borrower Summary  -  amounts in Crores)
 # ─────────────────────────────────────────────────────────────────
 
 # Borrower Summary row columns (after the institution label line):
@@ -108,7 +108,7 @@ def _parse_summary_row(row: str, live_idx: int = 2):
     Expected active = the 'Live Accts' column only. The bureau reports Delinquent
     accounts in a separate column; our extraction counts a delinquent (open,
     balance>0) facility as Active, so it can legitimately exceed the bureau's Live
-    count. We deliberately do NOT add Delinquent here — that mismatch should be
+    count. We deliberately do NOT add Delinquent here  -  that mismatch should be
     surfaced to the analyst, not silently absorbed.
 
     Two row shapes exist across CRIF Commercial report versions:
@@ -303,7 +303,7 @@ def nonstandard_dpd_by_date(text: str) -> dict:
     """
     Map {sanctioned_date: dpd} from the 'Top 5 Non-Standard Facilities' summary
     table. That table prints each delinquent facility's DPD cleanly (e.g. '57/SMA')
-    right beside its Sanctioned Date — far more reliable than the tiny, OCR-mangled
+    right beside its Sanctioned Date  -  far more reliable than the tiny, OCR-mangled
     per-account payment grid. We join it back to accounts on Sanctioned Date.
     """
     m = re.search(r'Top\s*\d?\s*Non[\s-]*Standard\s+Facilities', text, re.IGNORECASE)
@@ -334,7 +334,7 @@ _CLOSED_KEYWORDS = re.compile(
 
 def _is_closed(block: str, current_balance: int = None) -> bool:
     # Rule 0 (primary): the bureau's own colour-coded status strip, read from the
-    # left margin during OCR and injected as a marker. Most reliable signal —
+    # left margin during OCR and injected as a marker. Most reliable signal  - 
     # the per-account Closure Reason/Closed Date fields are usually blank.
     if "__STATUS_CLOSED__" in block:
         return True
@@ -352,14 +352,14 @@ def _is_closed(block: str, current_balance: int = None) -> bool:
     if wo and to_int(wo.group(1)) > 0:
         return True
     # Rule 4 (fallback, no strip / no explicit signal): the account is LIVE if it
-    # still has money against it — outstanding balance > 0 OR an open drawing power
+    # still has money against it  -  outstanding balance > 0 OR an open drawing power
     # (a sanctioned-but-undrawn facility is still live). Only when both are zero do
     # we treat it as closed. Current balance is the figure that actually drives the
     # report total, so a misclassified zero-balance account costs nothing there.
     drawing_power = _amount(block, r'Drawing\s+Power')
     if (current_balance and current_balance > 0) or drawing_power > 0:
         return False
-    # Exception: reported on its very first day (Info. as of == Sanctioned Date) —
+    # Exception: reported on its very first day (Info. as of == Sanctioned Date)  - 
     # newly originated, zero balance just means not yet drawn. Keep it live.
     if current_balance is not None and current_balance == 0:
         sanction_date = re.search(r'Sanctioned\s+Date\s*[:.]?\s*(\d{2}-\d{2}-\d{4})', block, re.IGNORECASE)
@@ -401,7 +401,7 @@ def parse_crif_commercial(text: str) -> tuple:
     blocks   = split_account_blocks(text)
     accounts = [extract_account(num, blk) for num, blk in blocks]
 
-    # Override DPD from the authoritative 'Top 5 Non-Standard Facilities' table —
+    # Override DPD from the authoritative 'Top 5 Non-Standard Facilities' table  - 
     # it reports each delinquent facility's DPD cleanly; the per-account payment
     # grid OCRs too poorly to trust. Joined back to accounts on Sanctioned Date.
     topn = nonstandard_dpd_by_date(text)

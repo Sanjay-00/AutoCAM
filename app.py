@@ -1,5 +1,5 @@
 """
-AutoCAM — CIBIL Report Analyser
+AutoCAM  -  CIBIL Report Analyser
 CRIF High Mark PDF → Structured Excel
 """
 
@@ -13,7 +13,7 @@ from parser import (
 from excel_generator import generate_excel, get_filename
 
 st.set_page_config(
-    page_title="AutoCAM — CIBIL",
+    page_title="AutoCAM  -  CIBIL",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -114,10 +114,10 @@ def _validation_badge(v):
     if bal_ok and cnt_ok:
         st.success("✅  Validation passed\n\n" + body)
     elif bal_ok:
-        st.warning("⚠️  Balance matches the summary, but the active count differs — "
+        st.warning("⚠️  Balance matches the summary, but the active count differs  -  "
                    "often a bureau active/closed labelling difference. Please review.\n\n" + body)
     else:
-        st.error("❌  Balance does not match the summary — review the extraction.\n\n" + body)
+        st.error("❌  Balance does not match the summary  -  review the extraction.\n\n" + body)
 
 
 def _to_df(accounts: list) -> pd.DataFrame:
@@ -174,7 +174,7 @@ def _on_ocr_progress(current: int, total: int):
     _progress_bar.progress(pct, text=f"Scanning page {current} of {total}…")
     _status_text.caption(
         f"OCR in progress · {current}/{total} pages done"
-        + (" — this takes a few minutes for large scanned reports" if current == 1 else "")
+        + ("  -  this takes a few minutes for large scanned reports" if current == 1 else "")
     )
 
 
@@ -210,7 +210,7 @@ with right:
     _score_badge(score)
 st.divider()
 
-# ── Key metrics — row 1 ───────────────────────────────────────────
+# ── Key metrics  -  row 1 ───────────────────────────────────────────
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Total Accounts",  len(accounts))
 c2.metric("Active",          len(active))
@@ -261,7 +261,7 @@ with tab_closed:
 
 if data["extraction_method"] == METHOD_OCR:
     st.caption(
-        "ℹ️ **Max DPD is approximate** on scanned reports — the dense payment-history "
+        "ℹ️ **Max DPD is approximate** on scanned reports  -  the dense payment-history "
         "grid has tiny digits that OCR can misread. Verify against the PDF for any "
         "delinquent (non-zero DPD) account before relying on it."
     )
@@ -274,7 +274,7 @@ with dl_col:
     excel_bytes = generate_excel(data)
     fname       = get_filename(name)
     st.download_button(
-        label=f"⬇️  Download Excel  —  {fname}",
+        label=f"⬇️  Download Excel   -   {fname}",
         data=excel_bytes,
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

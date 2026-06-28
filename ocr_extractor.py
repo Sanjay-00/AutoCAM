@@ -1,5 +1,5 @@
 """
-ocr_extractor.py — scanned-PDF front-end for AutoCAM.
+ocr_extractor.py  -  scanned-PDF front-end for AutoCAM.
 
 A scanned CIBIL report carries no extractable text. This module:
   1. detects that case (is_scanned),
@@ -30,6 +30,10 @@ _WIN_CANDIDATES = [
 
 def _configure_tesseract():
     import pytesseract
+    # We parallelise OCR across pages (one Tesseract call per worker thread), so pin
+    # each Tesseract call to a single OpenMP thread  -  otherwise N workers × M internal
+    # threads oversubscribe the CPU and run slower.
+    os.environ["OMP_THREAD_LIMIT"] = "1"
     override = os.getenv("TESSERACT_CMD")
     if override and os.path.exists(override):
         pytesseract.pytesseract.tesseract_cmd = override
@@ -86,7 +90,7 @@ _MIN_CONF     = 30    # drop very-low-confidence words (mostly noise glyphs)
 
 # CRIF Commercial ACE prints each account's live/closed status as a vertical
 # colored strip in the left margin: "ACTIVE" in red, "CLOSED" in green. This is
-# the bureau's own per-account label — far more reliable than guessing from the
+# the bureau's own per-account label  -  far more reliable than guessing from the
 # (usually blank) Closure Reason / Closed Date fields. We detect the strip colour
 # and inject a marker token into the reconstructed text so the parser can read it.
 STATUS_ACTIVE_TOKEN = "__STATUS_ACTIVE__"
@@ -179,7 +183,7 @@ def _inject_status(rows: list, strips: list) -> None:
     """
     Attach each strip's status token to a text row inside its account block. The
     strip spans the block's field area, so the FIRST row within [y_top, y_bottom]
-    is that account's own row (just below its header) — more reliable than mapping
+    is that account's own row (just below its header)  -  more reliable than mapping
     to the strip centre, which can fall on a header line above the block.
     """
     for y_top, y_bottom, token in strips:
@@ -191,10 +195,9 @@ def _inject_status(rows: list, strips: list) -> None:
         rows[idx] = (rows[idx][0], rows[idx][1] + " " + token)
 
 
-def _ocr_page(pytesseract, page) -> str:
-    """Geometry-aware OCR of one page, with a plain image_to_string fallback."""
+def _ocr_image(pytesseract, img) -> str:
+    """Geometry-aware OCR of one rendered page image, with a plain-text fallback."""
     from pytesseract import Output
-    img = _page_image(page, _OCR_MATRIX)
     try:
         data = pytesseract.image_to_data(img, output_type=Output.DICT)
         rows = _reconstruct_rows(data)
@@ -206,23 +209,77 @@ def _ocr_page(pytesseract, page) -> str:
     return pytesseract.image_to_string(img)
 
 
+def _ocr_page(pytesseract, page) -> str:
+    """OCR a PyMuPDF page (render, then delegate). Kept for direct callers."""
+    return _ocr_image(pytesseract, _page_image(page, _OCR_MATRIX))
+
+
+# Per-page OCR is ~95% of runtime and pages are independent, so we OCR them in
+# parallel. Rendering (MuPDF) stays on the main thread  -  MuPDF documents are NOT
+# thread-safe  -  but it runs as a pipeline: the main thread renders page N+1 while the
+# worker pool OCRs pages already rendered, so the render cost is hidden behind OCR.
+# The GIL is released during the tesseract subprocess, so worker threads truly run in
+# parallel. Results are reassembled in page order ⇒ output is byte-identical to serial
+# OCR, so accuracy is unchanged by construction.
+def _env_int(name: str, default: int) -> int:
+    """Positive int from env var `name`, else `default` (deploy-time tuning)."""
+    try:
+        v = int(os.getenv(name, ""))
+        return v if v > 0 else default
+    except (ValueError, TypeError):
+        return default
+
+
+# Auto-scale to the host's cores, but allow per-deploy overrides:
+#   OCR_WORKERS        -  parallel Tesseract workers (lower on a small box to save RAM)
+#   OCR_MAX_INFLIGHT   -  rendered-but-not-yet-OCR'd pages held in memory at once
+# e.g. on Streamlit Cloud (~1 GB / ~2 cores) set OCR_WORKERS=2, OCR_MAX_INFLIGHT=4.
+_OCR_WORKERS      = _env_int("OCR_WORKERS", max(1, min(12, (os.cpu_count() or 4))))
+_OCR_MAX_INFLIGHT = _env_int("OCR_MAX_INFLIGHT", _OCR_WORKERS + 4)
+
+
+def _render_pil(page):
+    """Render a page straight to a PIL image from the raw pixmap (no PNG round-trip)."""
+    from PIL import Image
+    pix  = page.get_pixmap(matrix=_OCR_MATRIX)
+    mode = {1: "L", 3: "RGB", 4: "RGBA"}.get(pix.n, "RGB")
+    return Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+
+
 def ocr_document(doc, on_progress=None) -> tuple:
     """
-    OCR every page. Returns (combined_text, page_texts) where page_texts[i] is
-    the geometry-reconstructed OCR of page i (used for page selection). Normalises
-    the same unicode quirks parser.extract_text handles.
-
-    on_progress(current, total) is called after each page if provided.
+    OCR every page. Returns (combined_text, page_texts) where page_texts[i] is the
+    geometry-reconstructed OCR of page i. on_progress(current, total) fires as pages
+    complete. Pages render on the main thread and OCR on a worker pool in a bounded
+    pipeline; output is identical to serial OCR.
     """
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
     pytesseract = _configure_tesseract()
-    page_texts = []
-    total = len(doc)
-    for i, page in enumerate(doc):
-        page_texts.append(_ocr_page(pytesseract, page))
-        if on_progress:
-            on_progress(i + 1, total)
+    total      = len(doc)
+    page_texts = [""] * total
+    inflight   = {}            # future -> page index
+    done       = 0
+
+    def _drain(finished):
+        nonlocal done
+        for fut in finished:
+            page_texts[inflight.pop(fut)] = fut.result()
+            done += 1
+            if on_progress:
+                on_progress(done, total)
+
+    with ThreadPoolExecutor(max_workers=_OCR_WORKERS) as pool:
+        for i in range(total):
+            if len(inflight) >= _OCR_MAX_INFLIGHT:        # keep memory bounded
+                finished, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+                _drain(finished)
+            img = _render_pil(doc[i])                     # main thread (MuPDF safe)
+            inflight[pool.submit(_ocr_image, pytesseract, img)] = i
+        _drain(list(inflight))                            # drain the rest
+
     combined = "\n".join(page_texts)
-    combined = combined.replace("\xa0", " ").replace("–", "-").replace("—", "-")
+    combined = combined.replace("\xa0", " ").replace("\u2013", "-").replace("\u2014", "-")
     return combined, page_texts
 
 
@@ -268,7 +325,7 @@ _VISION_PROMPT = (
     "- date_of_sanction = the 'Sanctioned Date' field (DD-MM-YYYY). Do NOT use "
     "'Info. as of' or 'Last Payment Date'.\n"
     "- sanction_amount = 'Sanctioned Amount'; current_balance = 'Current Balance' "
-    "(these are DIFFERENT fields — read each separately); overdue = 'Amount Overdue'.\n"
+    "(these are DIFFERENT fields  -  read each separately); overdue = 'Amount Overdue'.\n"
     "- entity = the 'Lender' value (use \"Not Disclosed\" if masked as XXXX).\n"
     "- type_of_loan = the 'Type' value.\n"
     "- max_dpd = worst days-past-due in the Payment History grid; 0 if every "

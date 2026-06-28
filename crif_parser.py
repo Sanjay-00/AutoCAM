@@ -1,5 +1,5 @@
 """
-crif_parser.py — CRIF High Mark CIBIL parser
+crif_parser.py  -  CRIF High Mark CIBIL parser
 Rule-based extraction: block splitting, field extraction, closed detection.
 """
 
@@ -160,7 +160,7 @@ _P4 = re.compile(
     re.MULTILINE,
 )
 
-# OCR sometimes corrupts the word "Account" in the block header — dropping the
+# OCR sometimes corrupts the word "Account" in the block header  -  dropping the
 # leading 'A' ("ccount Information") or splitting it ("Acco unt Information").
 # Tolerate both so no account block is lost. The trailing \n keeps the appendix
 # rows ("Account Information - Credit Grantor ...") from matching.
@@ -175,20 +175,20 @@ _BLOCK_FIELD  = re.compile(
 def split_account_blocks(text: str) -> list:
     """
     Multi-pass splitter handling all known CRIF HTML-to-PDF format variants:
-      P1/P2/P3 — standard numbered blocks (number after header)
-      P4        — number appears on line BEFORE "Account Information" header
-      P5        — number on same line as Account Type after header
-      Pass 2    — page-break recovery (number swallowed by browser header)
+      P1/P2/P3  -  standard numbered blocks (number after header)
+      P4         -  number appears on line BEFORE "Account Information" header
+      P5         -  number on same line as Account Type after header
+      Pass 2     -  page-break recovery (number swallowed by browser header)
     Returns list of (account_number: int, block_text: str).
     """
     candidates = []
 
-    # P1/P2/P3/P5 — block starts at "Account Information"
+    # P1/P2/P3/P5  -  block starts at "Account Information"
     for pat in _BLOCK_PATTERNS:
         for m in pat.finditer(text):
             candidates.append((m.start(), int(m.group(1))))
 
-    # P4 — number before header; block starts at "Account Information"
+    # P4  -  number before header; block starts at "Account Information"
     for m in _P4.finditer(text):
         num    = int(m.group(1))
         ai_pos = m.start(2)   # position of "Account Information"
@@ -235,7 +235,7 @@ def _next_line_value(block: str, label: str) -> str:
 
 
 _DATE_RE      = re.compile(r'\d{2}-\d{2}-\d{4}')
-# Dates that are NOT the disbursed date — exclude them in the fallback scan.
+# Dates that are NOT the disbursed date  -  exclude them in the fallback scan.
 _DATE_EXCLUDE = re.compile(
     r'(?:Ason|Last\s+Payment\s+Date|Closed\s+Date|Last\s+Reported|as\s+of)\s*[:.]?\s*$',
     re.IGNORECASE,
@@ -255,7 +255,7 @@ def _extract_date(block: str) -> str:
     # Fallback: row reconstruction sometimes splits the disbursed date onto the
     # line above its label (e.g. it lands on the Ownership row). Take the earliest
     # date in the block that isn't an Ason / Last-Payment / Closed / Reported date
-    # — disbursement is the origination event, so it's the oldest.
+    #  -  disbursement is the origination event, so it's the oldest.
     cands = []
     for dm in _DATE_RE.finditer(block):
         if not _DATE_EXCLUDE.search(block[max(0, dm.start() - 22): dm.start()]):
@@ -337,7 +337,7 @@ def _is_masked_entity(val: str) -> bool:
 
 def _extract_entity(block: str) -> str:
     """
-    Read the account's OWN Credit Grantor (per-block — positional lists misalign).
+    Read the account's OWN Credit Grantor (per-block  -  positional lists misalign).
     OCR writes the label as 'Credit Grantor:' / 'Grantor.' / 'Grantor', often with
     the value inline and the next column bleeding in. Masked grantors → 'NA'.
     """
@@ -425,7 +425,7 @@ def _is_closed(block: str) -> bool:
     """
     Rule 1: Closed Date has a valid date.
     Rule 2: Remarks contains 'Written-off'.
-    Rule 3: Compact block — 'Closed' before any field label.
+    Rule 3: Compact block  -  'Closed' before any field label.
     Rule 4: Total write-off amount field is non-zero.
     """
     val = _next_line_value(block, "Closed Date:")
@@ -520,7 +520,7 @@ def parse_crif(text: str) -> tuple:
     blocks   = split_account_blocks(text)
 
     # Entity & loan type: hybrid source. The compact summary's positional lists are
-    # the authoritative, clean source — but ONLY when they align 1:1 with the blocks
+    # the authoritative, clean source  -  but ONLY when they align 1:1 with the blocks
     # (true for digital/clean text). Under OCR garble the label count drifts (e.g. 34
     # blocks vs 13 labels), so there we fall back to per-block extraction. Some CRIF
     # variants don't even print Account Type in the detail block (only in the

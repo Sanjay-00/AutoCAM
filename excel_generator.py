@@ -23,11 +23,11 @@ WHITE         = "FFFFFF"
 LIGHT_GREY    = "F2F2F2"
 ALT_WHITE     = "FFFFFF"
 SCORE_GREEN   = "C6EFCE"   # score > 700
-SCORE_ORANGE  = "FFEB9C"   # score 600–700
+SCORE_ORANGE  = "FFEB9C"   # score 600-700
 SCORE_RED     = "FFC7CE"   # score < 600
 ACTIVE_GREEN  = "375623"   # Active text colour
 CLOSED_GREY   = "595959"   # Closed text colour
-DPD_ORANGE_BG = "FCE4D6"   # max DPD 31–90
+DPD_ORANGE_BG = "FCE4D6"   # max DPD 31-90
 DPD_RED_BG    = "FFC7CE"   # max DPD > 90
 DPD_CLEAR     = "C6EFCE"   # max DPD = 0
 TOTAL_BG      = "FFF2CC"   # total row
@@ -116,7 +116,7 @@ def generate_excel(data: dict) -> bytes:
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     # ────────────────────────────────────────
-    # ROW 1 — Borrower Name
+    # ROW 1  -  Borrower Name
     # ────────────────────────────────────────
     ws["A1"] = "Borrower Name:"
     ws["A1"].font      = _f(size=12, bold=True, color=NAVY)
@@ -128,7 +128,7 @@ def generate_excel(data: dict) -> bytes:
     ws.row_dimensions[1].height = 24
 
     # ────────────────────────────────────────
-    # ROW 2 — CIBIL Score
+    # ROW 2  -  CIBIL Score
     # ────────────────────────────────────────
     ws["A2"] = "CIBIL Score:"
     ws["A2"].font      = _f(size=12, bold=True, color=NAVY)
@@ -158,12 +158,12 @@ def generate_excel(data: dict) -> bytes:
     ws.row_dimensions[2].height = 22
 
     # ────────────────────────────────────────
-    # ROW 3 — Empty spacer
+    # ROW 3  -  Empty spacer
     # ────────────────────────────────────────
     ws.row_dimensions[3].height = 8
 
     # ────────────────────────────────────────
-    # ROW 4 — Table Headers
+    # ROW 4  -  Table Headers
     # ────────────────────────────────────────
     hdr_fill = _fill(NAVY)
     for col_idx, (header, _) in enumerate(COLUMNS, 1):
@@ -175,7 +175,7 @@ def generate_excel(data: dict) -> bytes:
     ws.row_dimensions[4].height = 30
 
     # ────────────────────────────────────────
-    # ROWS 5+ — Account Data
+    # ROWS 5+  -  Account Data
     # ────────────────────────────────────────
     DATA_START = 5
     for idx, acc in enumerate(accounts):
@@ -243,7 +243,7 @@ def generate_excel(data: dict) -> bytes:
                 cell.font      = _f()
                 cell.alignment = _a("left", wrap=True)
 
-            elif col_idx == 9:   # Max DPD — colour-coded
+            elif col_idx == 9:   # Max DPD  -  colour-coded
                 if dpd == 0:
                     cell.fill = _fill(DPD_CLEAR)
                     cell.font = _f(color="375623", bold=True)
