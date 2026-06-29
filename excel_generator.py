@@ -27,9 +27,26 @@ SCORE_ORANGE  = "FFEB9C"   # score 600-700
 SCORE_RED     = "FFC7CE"   # score < 600
 ACTIVE_GREEN  = "375623"   # Active text colour
 CLOSED_GREY   = "595959"   # Closed text colour
-DPD_ORANGE_BG = "FCE4D6"   # max DPD 31-90
-DPD_RED_BG    = "FFC7CE"   # max DPD > 90
 DPD_CLEAR     = "C6EFCE"   # max DPD = 0
+
+# DPD gradient: 4 bands that intensify orange → red as DPD rises
+_DPD_BANDS = [
+    (30,  None,     None),        # 1-30   : no colour
+    (60,  "FCE4D6", "843C0C"),    # 31-60  : light orange
+    (90,  "F4B183", "843C0C"),    # 61-90  : medium orange
+    (180, "FF7F7F", "7B0000"),    # 91-180 : light red
+    (None,"C00000", "FFFFFF"),    # 181+   : deep red, white text
+]
+
+
+def _dpd_style(dpd: int):
+    """Return (bg_hex, font_hex) for a DPD value, or (None, None) for 1-30."""
+    if dpd == 0:
+        return DPD_CLEAR, "375623"
+    for cap, bg, fg in _DPD_BANDS:
+        if cap is None or dpd <= cap:
+            return bg, fg
+    return "C00000", "FFFFFF"
 TOTAL_BG      = "FFF2CC"   # total row
 KP_BG         = "EBF3FB"   # key points rows
 KP_HDR_BG     = "D6E4F0"   # key points section header
@@ -87,6 +104,7 @@ COLUMNS = [
     ("EMI (₹)",            14),
     ("Overdue (₹)",        14),
     ("Entity",             20),
+    ("Ownership",          14),
     ("Type of Loan",       30),
     ("Max DPD",            10),
     ("Status",             10),
@@ -204,6 +222,7 @@ def generate_excel(data: dict) -> bytes:
             acc.get("emi", 0),
             acc.get("overdue", 0),
             acc.get("entity", "XXXX"),
+            acc.get("ownership", ""),
             acc.get("type_of_loan", ""),
             dpd,
             acc.get("status", "Active"),
@@ -238,27 +257,27 @@ def generate_excel(data: dict) -> bytes:
                 cell.font      = _f()
                 cell.alignment = _a("left")
 
-            elif col_idx == 8:   # Type of Loan
+            elif col_idx == 8:   # Ownership
+                cell.fill      = row_bg
+                cell.font      = _f()
+                cell.alignment = _a("center")
+
+            elif col_idx == 9:   # Type of Loan
                 cell.fill      = row_bg
                 cell.font      = _f()
                 cell.alignment = _a("left", wrap=True)
 
-            elif col_idx == 9:   # Max DPD  -  colour-coded
-                if dpd == 0:
-                    cell.fill = _fill(DPD_CLEAR)
-                    cell.font = _f(color="375623", bold=True)
-                elif dpd <= 30:
+            elif col_idx == 10:   # Max DPD - gradient colour
+                bg, fg = _dpd_style(dpd)
+                if bg is None:          # 1-30: plain
                     cell.fill = row_bg
                     cell.font = _f()
-                elif dpd <= 90:
-                    cell.fill = _fill(DPD_ORANGE_BG)
-                    cell.font = _f(color="843C0C", bold=True)
                 else:
-                    cell.fill = _fill(DPD_RED_BG)
-                    cell.font = _f(color="9C0006", bold=True)
+                    cell.fill = _fill(bg)
+                    cell.font = _f(color=fg, bold=True)
                 cell.alignment = _a("center")
 
-            elif col_idx == 10:   # Status
+            elif col_idx == 11:   # Status
                 cell.fill = row_bg
                 if value == "Active":
                     cell.font = _f(color=ACTIVE_GREEN, bold=True)
@@ -281,7 +300,7 @@ def generate_excel(data: dict) -> bytes:
     label_cell.border    = _b()
 
     sum_cell = ws.cell(row=total_row, column=4,
-                       value=f"=SUMIF(J{DATA_START}:J{last_data},\"Active\",D{DATA_START}:D{last_data})")
+                       value=f"=SUMIF(K{DATA_START}:K{last_data},\"Active\",D{DATA_START}:D{last_data})")
     sum_cell.number_format = '#,##0'
     sum_cell.font          = _f(bold=True, color=NAVY)
     sum_cell.alignment     = _a("right")
@@ -297,7 +316,7 @@ def generate_excel(data: dict) -> bytes:
     ws.row_dimensions[kp_gap_start + 1].height = 8
 
     kp_header_row = kp_gap_start + 2
-    ws.merge_cells(f"A{kp_header_row}:J{kp_header_row}")
+    ws.merge_cells(f"A{kp_header_row}:K{kp_header_row}")
     kp_hdr = ws.cell(row=kp_header_row, column=1,
                      value="Key Points for Loan Decision:")
     kp_hdr.font      = _f(size=12, bold=True, underline="single", color=NAVY)
@@ -307,7 +326,7 @@ def generate_excel(data: dict) -> bytes:
 
     for i, point in enumerate(key_points):
         pr = kp_header_row + 1 + i
-        ws.merge_cells(f"A{pr}:J{pr}")
+        ws.merge_cells(f"A{pr}:K{pr}")
         kp_cell = ws.cell(row=pr, column=1, value=f"  {i+1}. {point}")
         kp_cell.font      = _f(size=10)
         kp_cell.fill      = _fill(KP_BG)
