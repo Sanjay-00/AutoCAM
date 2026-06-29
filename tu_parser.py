@@ -104,12 +104,19 @@ _PRE_RE = re.compile(
 )
 _CF_RE = re.compile(r"Credit Facility\s+(\d+)\s*\n", re.MULTILINE)
 
+# Section headers that mark the boundary between borrower and guarantor facilities.
+# Numbered (e.g. "11.", "12.") and dash can be ASCII or en-dash (normalised at runtime).
+_GUARANTOR_HDR = re.compile(
+    r"\d+\.\s*CREDIT\s+FACILITY\s+DETAILS\s*[-–]\s*AS\s+GUARANTOR",
+    re.IGNORECASE,
+)
+
 
 def split_blocks(text: str) -> list:
     """
     Split on 'LAST REPORTED DATE : {date}' preamble markers.
     Each block contains the amounts table + CF header + DPD history.
-    Returns list of (cf_number: int, block_text: str).
+    Returns list of (cf_number: int, block_text: str, start_pos: int).
     """
     starts = [m.start() for m in _PRE_RE.finditer(text)]
     if not starts:
@@ -122,7 +129,7 @@ def split_blocks(text: str) -> list:
         cf_m       = _CF_RE.search(block_text)
         if not cf_m:
             continue
-        blocks.append((int(cf_m.group(1)), block_text))
+        blocks.append((int(cf_m.group(1)), block_text, start))
 
     return blocks
 
@@ -131,7 +138,7 @@ def split_blocks(text: str) -> list:
 # FIELD EXTRACTION
 # ─────────────────────────────────────────────────────────────────
 
-def _extract_account(cf_num: int, block: str) -> dict:
+def _extract_account(cf_num: int, block: str, ownership: str = "Borrower") -> dict:
     # Sanction amount + EMI (two-column header, values follow)
     m = re.search(
         r"SANCTIONED INR\s*\nINSTALLMENT AMOUNT\s*\n(₹\s*-?[\d,]+|-)\s*\n(₹\s*-?[\d,]+|-)?",
@@ -187,6 +194,7 @@ def _extract_account(cf_num: int, block: str) -> dict:
         "emi":              emi,
         "overdue":          overdue,
         "entity":           entity,
+        "ownership":        ownership,
         "type_of_loan":     loan_type,
         "max_dpd":          max_dpd,
         "status":           status,
@@ -257,6 +265,19 @@ def parse_transunion(text: str) -> tuple:
     score    = extract_score(text)
     reported = extract_totals(text)
     blocks   = split_blocks(text)
-    accounts = [_extract_account(num, blk) for num, blk in blocks]
+
+    # Find where the "AS GUARANTOR" section starts so every block before it
+    # is tagged Borrower and every block at/after it is tagged Guarantor.
+    guar_m      = _GUARANTOR_HDR.search(text)
+    guarantor_pos = guar_m.start() if guar_m else None
+
+    accounts = []
+    for num, blk, start_pos in blocks:
+        if guarantor_pos is not None and start_pos >= guarantor_pos:
+            ownership = "Guarantor"
+        else:
+            ownership = "Borrower"
+        accounts.append(_extract_account(num, blk, ownership))
+
     accounts.sort(key=lambda x: x["sr_no"])
     return name, score, accounts, reported, validate(accounts, reported)

@@ -231,6 +231,25 @@ def _extract_date(block: str) -> str:
     return m.group(1) if m else "NA"
 
 
+def _extract_ownership(block: str) -> str:
+    """
+    Ownership comes from 'Loan Terms For: <role>  Info. as of: <date>'.
+    'Applicant as Borrower' → 'Borrower'; 'Guarantor' → 'Guarantor'; etc.
+    """
+    m = re.search(
+        r'(?:Loan\s+)?Terms\s+For\s*:\s*(.*?)(?:Info\.?\s*as\s*of|$)',
+        block, re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return ""
+    val = re.sub(r'\s+', ' ', m.group(1)).strip()
+    if re.search(r'borrower', val, re.IGNORECASE):
+        return "Borrower"
+    if re.search(r'guarantor', val, re.IGNORECASE):
+        return "Guarantor"
+    return val.title() if val else ""
+
+
 def _extract_entity(block: str) -> str:
     val = _field(block, r'Lender')
     val = re.sub(r'[^\w &.,\'\-()/]', '', val).strip()
@@ -277,26 +296,35 @@ def _extract_loan_type(block: str) -> str:
 
 def _extract_max_dpd(block: str) -> int:
     """
-    DPD from the Payment History grid ('NNN/STD', 'NNN/SMA', ...).
+    DPD from the Payment History grid ('NNN/SMA', 'NNN/xxx', ...).
 
-    OCR routinely misreads the leading zeros of '000/STD' as '200/STD' or
-    '300/STD', which would fabricate severe delinquency on perfectly standard
-    accounts. Since 'STD' (Standard) means current = 0 DPD by definition, we
-    count DPD ONLY from non-standard buckets (SMA/SUB/DBT/LOS) where a positive
-    number is genuinely meaningful. Vision fallback recovers precise DPD when
-    needed.
+    CRIF Commercial uses 'xxx' as the class code placeholder (not 'STD').
+    A non-zero NNN paired with 'xxx' is therefore a genuine DPD reading.
+
+    OCR routinely misreads the leading zeros of '000/xxx' as '200/xxx', which
+    would fabricate delinquency. We guard against this by accepting 'xxx' cells
+    only when DPD >= 10 (single-digit OCR drift from 000 is implausible at that
+    magnitude). Named non-standard buckets (SMA/SUB/DBT/LOS) are trusted at any
+    positive value. Vision fallback recovers precise DPD when OCR fails on
+    colored cells.
     """
     vals = []
+    # Named non-standard buckets: any positive value is real delinquency
     for m in re.finditer(r'\b(\d{1,3})\s*/\s*(?:SMA|SUB|DBT|LOS)\b', block, re.IGNORECASE):
         v = int(m.group(1))
         if 0 < v < 999:
+            vals.append(v)
+    # CRIF Commercial 'xxx' class: accept when >= 10 to filter OCR noise on 000
+    for m in re.finditer(r'\b(\d{1,3})\s*/\s*xxx\b', block, re.IGNORECASE):
+        v = int(m.group(1))
+        if 10 <= v < 999:
             vals.append(v)
     return max(vals) if vals else 0
 
 
 # Non-standard asset classes (a positive DPD here is genuine delinquency).
 _NONSTD_DPD = re.compile(
-    r'(?<!\d)(\d{1,3})\s*/\s*(?:SMA|SMO|SM\d|SUB|DBT|DB\d|LOS|NPA|ARC)\b', re.IGNORECASE)
+    r'(?<!\d)(\d{1,3})\s*/\s*(?:SMA|SMO|SM\d|SUB|DBT|DB\d|LOS|NPA|ARC|xxx)\b', re.IGNORECASE)
 
 
 def nonstandard_dpd_by_date(text: str) -> dict:
@@ -383,6 +411,7 @@ def extract_account(ordinal: int, block: str) -> dict:
         "emi":              _amount(clean, r'Installment\s+Amount|EMI'),
         "overdue":          _amount(clean, r'Amount\s+Overdue'),
         "entity":           _extract_entity(clean),
+        "ownership":        _extract_ownership(clean),
         "type_of_loan":     _extract_loan_type(clean),
         "max_dpd":          _extract_max_dpd(clean),
         "status":           status,

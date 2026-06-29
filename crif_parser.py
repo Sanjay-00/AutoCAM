@@ -298,6 +298,37 @@ def _extract_emi(block: str) -> int:
     return to_int(m.group(1)) if m else 0
 
 
+_OWNERSHIP_KW = re.compile(
+    r'\b(INDIVIDUAL|GUARANTOR|JOINT|SINGLE|SOLE|CO-?BORROWER|PROPRIETOR)\b',
+    re.IGNORECASE,
+)
+
+
+def _extract_ownership(block: str) -> str:
+    """Read Ownership: field (INDIVIDUAL / GUARANTOR / JOINT / etc.)."""
+    m = re.search(r'Ownership\s*:\s*([^\n]*)', block, re.IGNORECASE)
+    if m:
+        # Value on the same line as "Ownership:"
+        kw = _OWNERSHIP_KW.search(m.group(1))
+        if kw:
+            return kw.group(1).title()
+        # OCR sometimes drops the value here (status marker swallowed the slot);
+        # strip the trailing newline first so split('\n')[0] gives the actual next line
+        kw2 = _OWNERSHIP_KW.search(block[m.end():].lstrip('\n').split('\n')[0])
+        if kw2:
+            return kw2.group(1).title()
+
+    # Fallback: OCR dropped the "Ownership:" label entirely.
+    # The value still appears on the "Disbursed Date:" line (adjacent field).
+    m2 = re.search(r'[^\n]*Disbursed\s+Date[^\n]*', block, re.IGNORECASE)
+    if m2:
+        kw = _OWNERSHIP_KW.search(m2.group(0))
+        if kw:
+            return kw.group(1).title()
+
+    return ""
+
+
 # Words that mark the end of a Credit Grantor value (the next column's label).
 _ENTITY_STOP = re.compile(
     r'\b(?:Account|Lender|Ason|Disbursed|Disbd|Ownership|Type|Last|Closed|Cash)\b',
@@ -499,6 +530,7 @@ def extract_account(acct_num: int, block: str,
         "emi":              _extract_emi(block),
         "overdue":          _extract_overdue(block),
         "entity":           entity if entity else _extract_entity(block),
+        "ownership":        _extract_ownership(block),
         "type_of_loan":     loan_type if loan_type else _extract_loan_type(block),
         "max_dpd":          _extract_max_dpd(block),
         "status":           "Closed" if _is_closed(block) else "Active",
