@@ -273,12 +273,82 @@ def _val_quality(v: dict) -> tuple:
     return (1 if v.get("valid") else 0, -err)
 
 
-def _parse_crif_commercial(text, doc, scanned, page_texts, api_key) -> dict:
+def _find_account_page(acc: dict, page_texts: list) -> int | None:
+    """Return the page index whose OCR text contains this account's sanction date."""
+    date = acc.get("date_of_sanction", "")
+    if not date or date == "NA":
+        return None
+    for pg_idx, pg_text in enumerate(page_texts):
+        if date in pg_text:
+            return pg_idx
+    return None
+
+
+def _enrich_dpd_vision(accounts: list, doc, page_texts: list, api_key: str,
+                       on_progress=None) -> None:
+    """
+    For scanned CRIF Commercial PDFs, OCR cannot read text inside coloured
+    (orange/red) payment history cells. This function sends each affected page
+    to Gemini Vision and patches max_dpd on accounts that were 0 from OCR.
+    Mutates accounts in-place; called only when method != METHOD_VISION.
+
+    Pages are rendered on the main thread (PyMuPDF is not thread-safe) then
+    all Gemini API calls run in parallel, turning ~N×10s into ~10s total.
+    on_progress(done, total) fires as each Vision call completes.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Group zero-DPD accounts by their PDF page
+    page_map: dict[int, list] = {}
+    for acc in accounts:
+        if acc.get("max_dpd", 0) == 0:
+            pg = _find_account_page(acc, page_texts)
+            if pg is not None:
+                page_map.setdefault(pg, []).append(acc)
+
+    if not page_map:
+        return
+
+    # Render all page images on the main thread first
+    page_uris = {pg_idx: ocr_extractor._img_data_uri(doc[pg_idx])
+                 for pg_idx in page_map}
+
+    total = len(page_map)
+    done_count = 0
+
+    def _call(pg_idx):
+        return pg_idx, ocr_extractor.vision_extract_dpd_from_uri(
+            page_uris[pg_idx], page_map[pg_idx], api_key, _llm_invoke
+        )
+
+    with ThreadPoolExecutor(max_workers=min(total, 6)) as pool:
+        futures = {pool.submit(_call, pg_idx): pg_idx for pg_idx in page_map}
+        for fut in as_completed(futures):
+            done_count += 1
+            if on_progress:
+                on_progress(done_count, total)
+            try:
+                pg_idx, dpd_map = fut.result()
+            except Exception:
+                continue
+            for acc in page_map[pg_idx]:
+                key = f"{acc['date_of_sanction']}|{acc.get('sanction_amount', 0)}"
+                if key in dpd_map and dpd_map[key] > 0:
+                    acc["max_dpd"] = dpd_map[key]
+
+
+def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
+                           on_dpd_progress=None, enrich_dpd: bool = True) -> dict:
     """
     CRIF Commercial ACE path. Rule-based on the (possibly OCR'd) text; when the
     source was scanned and the parse fails the report's summary validation, fall
     back to Gemini Vision on the targeted account pages  -  but only adopt the
     Vision result if it validates at least as well as the OCR result.
+
+    A second Vision pass (_enrich_dpd_vision) always runs for scanned PDFs with
+    an api_key: it corrects max_dpd on accounts where OCR returned 0 by reading
+    coloured payment-history cells directly from the page image.
+    on_dpd_progress(done, total) fires after each page Vision call completes.
     """
     name, score, blocks, accounts, reported = parse_crif_commercial(text)
     _renumber(accounts)
@@ -298,6 +368,12 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key) -> dict:
             if _val_quality(v_vis) > _val_quality(validation):
                 accounts, validation, method = vis, v_vis, METHOD_VISION
 
+    # DPD enrichment: runs even when validation passed; skipped if Vision already
+    # extracted the full account set (which includes DPD from the image).
+    if enrich_dpd and scanned and api_key and page_texts and method != METHOD_VISION:
+        _enrich_dpd_vision(accounts, doc, page_texts, api_key,
+                           on_progress=on_dpd_progress)
+
     return {
         "name":              name,
         "score":             score,
@@ -308,12 +384,16 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key) -> dict:
     }
 
 
-def parse(pdf_source, api_key: str = None, on_progress=None) -> dict:
+def parse(pdf_source, api_key: str = None, on_progress=None,
+          on_dpd_progress=None, enrich_dpd: bool = True) -> dict:
     """
     Parse a CIBIL PDF (CRIF retail, CRIF Commercial, or TransUnion) and return
     structured data. Scanned PDFs are OCR'd first.
 
     on_progress(current_page, total_pages) is called during OCR if provided.
+    on_dpd_progress(done, total) is called during Vision DPD enrichment (CRIF
+    Commercial scanned only).
+    enrich_dpd: set False to skip Vision DPD enrichment (faster, no API cost).
 
     Returns dict:
         name, score, accounts, extraction_method, validation, provider
@@ -338,7 +418,9 @@ def parse(pdf_source, api_key: str = None, on_progress=None) -> dict:
 
         # ── CRIF Commercial ACE path ──────────────────────────────
         if provider == "crif_commercial":
-            return _parse_crif_commercial(text, doc, scanned, page_texts, api_key)
+            return _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
+                                          on_dpd_progress=on_dpd_progress,
+                                          enrich_dpd=enrich_dpd)
 
         # ── CRIF retail path ──────────────────────────────────────
         name, score, blocks, accounts, reported = parse_crif(text)
