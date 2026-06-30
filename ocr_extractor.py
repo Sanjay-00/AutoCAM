@@ -343,6 +343,64 @@ def _img_data_uri(page) -> str:
     return f"data:image/png;base64,{b64}"
 
 
+import re as _re
+
+
+_DPD_PAGE_PROMPT = """\
+This page is from a CRIF High Mark COMMERCIAL ACE credit report.
+The Payment History/Asset Classification table shows cells like "NNN/xxx" where NNN = days \
+past due (e.g. "033/xxx" → 33 DPD, "000/xxx" → 0 DPD, "546/xxx" → 546 DPD). \
+Coloured cells (orange/red) mean non-zero DPD — read the number carefully even inside coloured cells.
+
+For EACH account listed below (identified by Sanctioned Date and Sanctioned Amount), \
+find its Payment History grid and return the MAXIMUM NNN value across all months.
+
+Accounts on this page:
+{account_list}
+
+Return ONLY a JSON object mapping each "DATE|AMOUNT" key to its max DPD integer:
+{{"DD-MM-YYYY|AMOUNT": 33, "DD-MM-YYYY|AMOUNT": 546}}
+Use 0 if the account's history is all 000 or not found. No other text.\
+"""
+
+
+def _strip_json(text: str) -> str:
+    text = _re.sub(r'^```(?:json)?\s*', '', text.strip())
+    return _re.sub(r'\s*```$', '', text).strip()
+
+
+def vision_extract_dpd_from_uri(img_uri: str, accounts: list,
+                                api_key: str, invoke_fn) -> dict:
+    """
+    Ask Gemini to read max DPD for accounts using a pre-rendered page image URI.
+    Separated from rendering so callers can parallelise the API calls while keeping
+    PyMuPDF rendering on the main thread (MuPDF is not thread-safe).
+    Returns {"{date}|{amount}": dpd_int}.
+    """
+    keys = [f"{a['date_of_sanction']}|{a.get('sanction_amount', 0)}" for a in accounts]
+    account_list = "\n".join(f"- {k}" for k in keys)
+    content = [
+        {"type": "text", "text": _DPD_PAGE_PROMPT.format(account_list=account_list)},
+        {"type": "image_url", "image_url": img_uri},
+    ]
+    try:
+        raw    = invoke_fn(api_key, content)
+        parsed = json.loads(_strip_json(raw))
+        if isinstance(parsed, dict):
+            return {k: int(float(str(v))) for k, v in parsed.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def vision_extract_dpd_per_page(doc, page_idx: int, accounts: list,
+                                 api_key: str, invoke_fn) -> dict:
+    """Convenience wrapper: renders the page then calls vision_extract_dpd_from_uri."""
+    return vision_extract_dpd_from_uri(
+        _img_data_uri(doc[page_idx]), accounts, api_key, invoke_fn
+    )
+
+
 def vision_extract_accounts(doc, page_indices: list, api_key: str,
                             invoke_fn=None, postprocess_fn=None,
                             chunk_size: int = 8) -> list:

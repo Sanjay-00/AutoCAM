@@ -265,16 +265,22 @@ _LOAN_TYPE_NORMALIZE = {
     r'above\s+1\s+year\s+and\s+upto\s+3\s+years\b.*':               'Medium term loan (1-3 years)',
     r'^-?\s*in\s+inr\s*$':                                            'Unknown',
     r'^in\s+inr\s*$':                                                  'Unknown',
-    r'.*\bsecured\b.*\bbusiness\s+loan\b.*':                           'Unsecured Business Loan -In INR',
-    r'.*\bbusiness\s+loan\b.*':                                        'Business Loan -In INR',
+    r'.*\bsecured\b.*\bbusiness\s+loan\b.*':                           'Unsecured Business Loan',
+    r'.*\bbusiness\s+loan\b.*':                                        'Business Loan',
+    r'commercial\s*vehicle\s*loan\b.*':                               'Commercial Vehicle Loan',
+    r'construction\s*equipment\s*loan\b.*':                           'Construction Equipment Loan',
+    r'equipment\s+financ.*':                                           'Equipment Financing',
+    r'^\(construction.*office.*medical.*\).*':                        'Equipment Financing',
+    r'^\(.*\)$':                                                       'Equipment Financing',
 }
 
 
 def _extract_loan_type(block: str) -> str:
     val = _field(block, r'Type')
     val = re.sub(r'\s{2,}', ' ', val).strip(' -')
+    # Strip "- In INR" / "-In INR" currency suffix (appears on same line as loan type)
+    val = re.sub(r'\s*-?\s*In\s+INR\s*$', '', val, flags=re.IGNORECASE).strip(' -')
     # Strip OCR garbage from the DPD/Asset Classification column that bleeds in
-    # when the line has no clean separator: "Long term loan (period above np /psset..."
     val = re.sub(r'\s+(?:np\s*/|[A-Z]{2,}/|\d+\s*/|DPD)\s*.*$', '', val, flags=re.IGNORECASE).strip()
     # Stop at any ALL-CAPS word sequence that looks like a new field heading
     m = re.search(r'\s{2,}[A-Z]{2,}', val)

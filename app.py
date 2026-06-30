@@ -4,6 +4,11 @@ CRIF High Mark PDF → Structured Excel
 """
 
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import pandas as pd
 import streamlit as st
 from parser import (
@@ -159,9 +164,17 @@ st.divider()
 # ── Upload & trigger ──────────────────────────────────────────────
 uploaded = st.file_uploader("Upload CRIF CIBIL PDF", type=["pdf"], label_visibility="visible")
 
-col_btn, _ = st.columns([1, 4])
+col_btn, col_dpd, _ = st.columns([1, 2, 2])
 with col_btn:
     run = st.button("🔍  Extract Data", type="primary", use_container_width=True, disabled=not uploaded)
+with col_dpd:
+    use_vision_dpd = st.checkbox(
+        "Enrich DPD via Vision (Gemini)",
+        value=True,
+        help="Uses Gemini Vision to read DPD values from coloured payment-history cells "
+             "in scanned CRIF Commercial reports, catches delinquency that OCR misses. "
+             "Adds ~15s and costs ~₹0.17 per report.",
+    )
 
 if not (uploaded and run):
     st.stop()
@@ -180,8 +193,17 @@ def _on_ocr_progress(current: int, total: int):
     )
 
 
+def _on_dpd_progress(done: int, total: int):
+    _progress_bar.progress(100, text=f"Enriching DPD via Vision… page {done} of {total}")
+    _status_text.caption(
+        f"Reading coloured payment-history cells with Gemini Vision · {done}/{total} pages"
+    )
+
+
 try:
-    data = parse(uploaded, api_key=_load_api_key(), on_progress=_on_ocr_progress)
+    data = parse(uploaded, api_key=_load_api_key(), on_progress=_on_ocr_progress,
+                 on_dpd_progress=_on_dpd_progress if use_vision_dpd else None,
+                 enrich_dpd=use_vision_dpd)
 except Exception as e:
     _progress_bar.empty()
     _status_text.empty()
