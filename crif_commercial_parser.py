@@ -141,15 +141,24 @@ def extract_reported_totals(text: str) -> dict:
 
     # Detect row format: if Lender(#) appears on the same header line as Total Accts,
     # data rows include Lender# as the first column (live_idx=2); otherwise live_idx=1.
-    lender_inline = bool(re.search(r'Lender.{0,30}Total\s+Accts', section, re.IGNORECASE))
+    # Collapse whitespace first: some digital PDFs put each header/cell on its own
+    # text line (one value per line) rather than joining a row onto one line the
+    # way OCR'd/scanned text does, which would otherwise break both this check and
+    # the row capture below.
+    flat = re.sub(r'\s+', ' ', section)
+    lender_inline = bool(re.search(r'Lender.{0,30}Total\s+Accts', flat, re.IGNORECASE))
     live_idx = 2 if lender_inline else 1
 
     active_sum, out_sum, found = 0, 0.0, False
     for label in ("Your Institution", "Other Institution"):
-        m = re.search(re.escape(label) + r'\s*\n([^\n]+)', section)
+        m = re.search(
+            re.escape(label) + r'\s*\n(.*?)(?=\n(?:Your Institution|Other Institution)\b|\n\*\s*Only|\Z)',
+            section, re.DOTALL,
+        )
         if not m:
             continue
-        parsed = _parse_summary_row(m.group(1), live_idx=live_idx)
+        row = re.sub(r'\s+', ' ', m.group(1)).strip()
+        parsed = _parse_summary_row(row, live_idx=live_idx)
         if not parsed:
             continue
         active, outstanding = parsed
@@ -199,6 +208,66 @@ def split_account_blocks(text: str) -> list:
         end = starts[i + 1] if i + 1 < len(starts) else len(text)
         blocks.append((i + 1, text[start:end]))
     return blocks
+
+
+# Alternate per-account anchor. Some CRIF Commercial digital layouts group
+# several 'Account/ Trade History' entries (each with its own Sanctioned Date,
+# Sanctioned Amount, Current Balance, Lender) under a single 'Loan Terms For:'
+# balance-history block, while other 'Loan Terms For:' blocks end up with none
+# of the entries that belong to them  -  split_account_blocks then misattributes
+# accounts (e.g. 2 trade entries in block N, 0 in block N+1) or drops real
+# accounts as "phantom". Each trade entry's own 'Type:' field line precedes its
+# financial fields and does not repeat elsewhere, so it anchors 1:1 with the
+# report's true account count in that layout.
+_TRADE_MARKER = re.compile(r'\bType:\s*\n')
+
+
+def split_trade_blocks(text: str) -> list:
+    """Returns list of (ordinal, block_text), one per 'Type:' occurrence."""
+    starts = [m.start() for m in _TRADE_MARKER.finditer(text)]
+    if not starts:
+        return []
+    blocks = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        blocks.append((i + 1, text[start:end]))
+    return blocks
+
+
+def _ownership_before(text: str, pos: int) -> str:
+    """
+    Trade blocks (split_trade_blocks) don't reliably carry their own 'Loan Terms
+    For:' role field, since that label sits in a different section than the
+    'Type:'-anchored financial fields. Look backward for the nearest one instead
+    - the role applies to every trade entry until the next 'Loan Terms For:'.
+    """
+    role = ""
+    for m in _BLOCK_MARKER.finditer(text, 0, pos):
+        role = m
+    if not role:
+        return ""
+    tail = text[role.end():role.end() + 200]
+    val  = re.sub(r'\s+', ' ', _INFO_MARKER.split(tail)[0]).strip()
+    if re.search(r'borrower', val, re.IGNORECASE):
+        return "Borrower"
+    if re.search(r'guarantor', val, re.IGNORECASE):
+        return "Guarantor"
+    if re.search(r'co-?applicant|co-?borrower', val, re.IGNORECASE):
+        return "Co-Applicant"
+    return ""
+
+
+def _quality(accounts: list, reported: dict) -> float:
+    """Combined relative error of extracted active count/balance vs reported totals. Lower is better."""
+    active = [a for a in accounts if a.get("status") == "Active"]
+    ec, eb = len(active), sum(a.get("current_balance") or 0 for a in active)
+    xc, xb = reported.get("account_count"), reported.get("total_balance")
+    err = 0.0
+    if xc:
+        err += abs(ec - xc) / xc
+    if xb:
+        err += abs(eb - xb) / xb
+    return err
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -267,7 +336,7 @@ _LOAN_TYPE_NORMALIZE = {
     r'^in\s+inr\s*$':                                                  'Unknown',
     r'.*\bsecured\b.*\bbusiness\s+loan\b.*':                           'Unsecured Business Loan',
     r'.*\bbusiness\s+loan\b.*':                                        'Business Loan',
-    r'commercial\s*vehicle\s*loan\b.*':                               'Commercial Vehicle Loan',
+    r'[cf]ommercial\s*vehicle\s*loan\b.*':                            'Commercial Vehicle Loan',
     r'construction\s*equipment\s*loan\b.*':                           'Construction Equipment Loan',
     r'equipment\s+financ.*':                                           'Equipment Financing',
     r'^\(construction.*office.*medical.*\).*':                        'Equipment Financing',
@@ -276,7 +345,11 @@ _LOAN_TYPE_NORMALIZE = {
 
 
 def _extract_loan_type(block: str) -> str:
-    val = _field(block, r'Type')
+    # Require a literal colon after 'Type' (the real trade label is always 'Type:').
+    # A loose substring match on 'Type' also hits the unrelated 'Type of Relationship'
+    # applicant-details header that can precede the real label in the same block.
+    m = re.search(r'\bType\s*:\s*(.*?)(?:' + _STOP + r'|\n|$)', block, re.IGNORECASE)
+    val = m.group(1).strip() if m else ""
     val = re.sub(r'\s{2,}', ' ', val).strip(' -')
     # Strip "- In INR" / "-In INR" currency suffix (appears on same line as loan type)
     val = re.sub(r'\s*-?\s*In\s+INR\s*$', '', val, flags=re.IGNORECASE).strip(' -')
@@ -290,6 +363,14 @@ def _extract_loan_type(block: str) -> str:
     for pat, replacement in _LOAN_TYPE_NORMALIZE.items():
         if re.match(pat, val, re.IGNORECASE):
             return replacement
+    # Fallback: if what we extracted is clearly OCR noise (too short or a known garbage
+    # token like "ppp"), search the full block text for a recognizable loan type phrase.
+    # This recovers cases where column-bleed puts the type text before the "Type:" label.
+    if len(val) <= 4 or val.lower() in ('ppp', 'std', 'sma', 'sub', 'dbt', 'los'):
+        for pat, replacement in _LOAN_TYPE_NORMALIZE.items():
+            if re.search(pat, block, re.IGNORECASE):
+                return replacement
+        return "Unknown"
     # Fix common OCR character substitutions
     val = re.sub(r'Wenicle|Welnicle|Venicle', 'Vehicle', val, flags=re.IGNORECASE)
     val = re.sub(r"[=\'`]+(\w)", r' \1', val).strip()   # apostrophe mid-word → space
@@ -300,7 +381,7 @@ def _extract_loan_type(block: str) -> str:
     return val
 
 
-def _extract_max_dpd(block: str) -> int:
+def _extract_max_dpd(block: str) -> int | None:
     """
     DPD from the Payment History grid ('NNN/SMA', 'NNN/xxx', ...).
 
@@ -313,7 +394,16 @@ def _extract_max_dpd(block: str) -> int:
     magnitude). Named non-standard buckets (SMA/SUB/DBT/LOS) are trusted at any
     positive value. Vision fallback recovers precise DPD when OCR fails on
     colored cells.
+
+    Returns None (not 0) when the grid pattern wasn't found at all in the
+    block - that means OCR couldn't read the payment-history table, which is
+    a different situation from confidently reading it as all-zero/standard.
+    Callers render None as "Check CIBIL" instead of a silent 0.
     """
+    raw_matches = list(re.finditer(r'\b\d{1,3}\s*/\s*(?:SMA|SUB|DBT|LOS|xxx)\b', block, re.IGNORECASE))
+    if not raw_matches:
+        return None
+
     vals = []
     # Named non-standard buckets: any positive value is real delinquency
     for m in re.finditer(r'\b(\d{1,3})\s*/\s*(?:SMA|SUB|DBT|LOS)\b', block, re.IGNORECASE):
@@ -366,14 +456,25 @@ _CLOSED_KEYWORDS = re.compile(
 )
 
 
+_HTML_STATUS_BADGE = re.compile(
+    r'Info\.?\s*as\s*\n?\s*of\s*:\s*\d{2}-\d{2}-\d{4}\s*\n?\s*(ACTIVE|CLOSED)\b'
+)
+
+
 def _is_closed(block: str, current_balance: int = None) -> bool:
-    # Rule 0 (primary): the bureau's own colour-coded status strip, read from the
-    # left margin during OCR and injected as a marker. Most reliable signal  - 
-    # the per-account Closure Reason/Closed Date fields are usually blank.
+    # Rule 0 (primary): the bureau's own colour-coded status strip. For scanned
+    # PDFs it's read from the left margin during OCR and injected as a marker;
+    # for HTML sources the same badge is literal text right after 'Info. as
+    # of: <date>' (a colour-coded pill in the rendered page). Most reliable
+    # signal either way  -  the per-account Closure Reason/Closed Date fields
+    # are usually blank even on accounts that are genuinely closed.
     if "__STATUS_CLOSED__" in block:
         return True
     if "__STATUS_ACTIVE__" in block:
         return False
+    m = _HTML_STATUS_BADGE.search(block)
+    if m:
+        return m.group(1).upper() == "CLOSED"
     # Rule 1: the Closure Reason VALUE names a terminal status.
     reason = _field(block, r'Closure\s+(?:Reason|Status)')
     if reason and _CLOSED_KEYWORDS.search(reason):
@@ -405,14 +506,30 @@ def _is_closed(block: str, current_balance: int = None) -> bool:
 
 def extract_account(ordinal: int, block: str) -> dict:
     balance = _amount(block, r'Current\s+Balance')
+    # Fallback: scanned OCR sometimes can't read the Current Balance field but
+    # CAN read Drawing Power (same value for active facilities). Use it when
+    # balance is 0 and drawing power is present.
+    if balance == 0:
+        dp = _amount(block, r'Drawing\s+Power')
+        if dp > 0:
+            balance = dp
     # Status uses the raw block (it carries the injected strip marker); all other
     # fields use a cleaned copy so the marker can't bleed into entity/loan type.
     status = "Closed" if _is_closed(block, balance) else "Active"
     clean  = re.sub(r'__STATUS_(?:ACTIVE|CLOSED)__', '', block)
+    sanction = _amount(clean, r'Sanctioned\s+Amount')
+    # Use None for amounts that are 0 on Active accounts — signals a read failure
+    # (0 is never valid for sanction/balance on a live loan). Displayed as
+    # "Check CIBIL" in the app and Excel.
+    if status == "Active":
+        if sanction == 0:
+            sanction = None
+        if balance == 0:
+            balance = None
     return {
         "sr_no":            ordinal,
         "date_of_sanction": _extract_date(clean),
-        "sanction_amount":  _amount(clean, r'Sanctioned\s+Amount'),
+        "sanction_amount":  sanction,
         "current_balance":  balance,
         "emi":              _amount(clean, r'Installment\s+Amount|EMI'),
         "overdue":          _amount(clean, r'Amount\s+Overdue'),
@@ -435,8 +552,36 @@ def parse_crif_commercial(text: str) -> tuple:
     reported = extract_reported_totals(text)
     blocks   = split_account_blocks(text)
     accounts = [extract_account(num, blk) for num, blk in blocks]
+    # Drop phantom blocks: digital PDFs produce orphan fragments (balance-history
+    # columns split off by a repeated "Loan Terms For" page header) that have no
+    # extractable date, sanction amount, or balance — not real accounts.
+    accounts = [a for a in accounts
+                if not (a["date_of_sanction"] == "NA"
+                        and a["sanction_amount"] == 0
+                        and a["current_balance"] == 0)]
 
-    # Override DPD from the authoritative 'Top 5 Non-Standard Facilities' table  - 
+    # 'Loan Terms For:' blocks can still misattribute accounts even when the
+    # block count happens to match the 'Type:' trade-entry count (see
+    # split_trade_blocks) — always compare both splits against the report's own
+    # totals and keep whichever is closer, the same way parser.py picks between
+    # OCR and Vision extraction.
+    trade_starts = [m.start() for m in _TRADE_MARKER.finditer(text)]
+    trade_blocks = split_trade_blocks(text)
+    if trade_blocks:
+        trade_accounts = []
+        for (num, blk), start in zip(trade_blocks, trade_starts):
+            a = extract_account(num, blk)
+            if not a["ownership"]:
+                a["ownership"] = _ownership_before(text, start)
+            trade_accounts.append(a)
+        trade_accounts = [a for a in trade_accounts
+                          if not (a["date_of_sanction"] == "NA"
+                                  and a["sanction_amount"] == 0
+                                  and a["current_balance"] == 0)]
+        if trade_accounts and _quality(trade_accounts, reported) < _quality(accounts, reported):
+            blocks, accounts = trade_blocks, trade_accounts
+
+    # Override DPD from the authoritative 'Top 5 Non-Standard Facilities' table  -
     # it reports each delinquent facility's DPD cleanly; the per-account payment
     # grid OCRs too poorly to trust. Joined back to accounts on Sanctioned Date.
     topn = nonstandard_dpd_by_date(text)
@@ -444,7 +589,8 @@ def parse_crif_commercial(text: str) -> tuple:
         for a in accounts:
             d = a.get("date_of_sanction")
             if d in topn:
-                a["max_dpd"] = max(a["max_dpd"], topn[d])
+                # a["max_dpd"] may be None (grid unread) - this table resolves it
+                a["max_dpd"] = max(a["max_dpd"] or 0, topn[d])
 
     accounts.sort(key=lambda x: x["sr_no"])
     return name, score, blocks, accounts, reported

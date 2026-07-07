@@ -125,18 +125,24 @@ def _validation_badge(v):
         st.error("❌  Balance does not match the summary  -  review the extraction.\n\n" + body)
 
 
+_CHECK_CIBIL = "Check CIBIL"
+
+def _amt(v):
+    """Return value as-is if numeric, or 'Check CIBIL' sentinel if None."""
+    return _CHECK_CIBIL if v is None else v
+
 def _to_df(accounts: list) -> pd.DataFrame:
     return pd.DataFrame([{
         "Sr.No":            a["sr_no"],
         "Date of Sanction": a["date_of_sanction"],
-        "Sanction Amt":     a["sanction_amount"],
-        "Current Balance":  a["current_balance"],
+        "Sanction Amt":     _amt(a["sanction_amount"]),
+        "Current Balance":  _amt(a["current_balance"]),
         "EMI":              a["emi"],
         "Overdue":          a["overdue"],
         "Entity":           a["entity"],
         "Ownership":        a.get("ownership", ""),
         "Type of Loan":     a["type_of_loan"],
-        "Max DPD":          a["max_dpd"],
+        "Max DPD":          _amt(a["max_dpd"]),
         "Status":           a["status"],
     } for a in accounts])
 
@@ -144,36 +150,38 @@ def _to_df(accounts: list) -> pd.DataFrame:
 _COL_CFG = {
     "Sr.No":            st.column_config.NumberColumn("Sr.No",            width="small"),
     "Date of Sanction": st.column_config.TextColumn(  "Date of Sanction", width="medium"),
-    "Sanction Amt":     st.column_config.NumberColumn("Sanction Amt (₹)", format="₹%d"),
-    "Current Balance":  st.column_config.NumberColumn("Current Bal (₹)",  format="₹%d"),
+    "Sanction Amt":     st.column_config.TextColumn(  "Sanction Amt (₹)"),
+    "Current Balance":  st.column_config.TextColumn(  "Current Bal (₹)"),
     "EMI":              st.column_config.NumberColumn("EMI (₹)",           format="₹%d"),
     "Overdue":          st.column_config.NumberColumn("Overdue (₹)",       format="₹%d"),
     "Entity":           st.column_config.TextColumn(  "Entity"),
     "Ownership":        st.column_config.TextColumn(  "Ownership",         width="small"),
     "Type of Loan":     st.column_config.TextColumn(  "Type of Loan"),
-    "Max DPD":          st.column_config.NumberColumn("Max DPD",           width="small"),
+    "Max DPD":          st.column_config.TextColumn(  "Max DPD",           width="small"),
     "Status":           st.column_config.TextColumn(  "Status",            width="small"),
 }
 
 
 # ── Page header ───────────────────────────────────────────────────
 st.markdown("## 🏦 AutoCAM &nbsp;·&nbsp; CIBIL Report Analyser")
-st.caption("Upload a CRIF High Mark CIBIL PDF · Extracts structured loan data · Outputs Excel")
+st.caption("Upload a CRIF High Mark CIBIL PDF or HTML report · Extracts structured loan data · Outputs Excel")
 st.divider()
 
 # ── Upload & trigger ──────────────────────────────────────────────
-uploaded = st.file_uploader("Upload CRIF CIBIL PDF", type=["pdf"], label_visibility="visible")
+uploaded = st.file_uploader("Upload CRIF CIBIL PDF or HTML", type=["pdf", "html", "htm"], label_visibility="visible")
 
 col_btn, col_dpd, _ = st.columns([1, 2, 2])
 with col_btn:
     run = st.button("🔍  Extract Data", type="primary", use_container_width=True, disabled=not uploaded)
 with col_dpd:
     use_vision_dpd = st.checkbox(
-        "Enrich DPD via Vision (Gemini)",
-        value=True,
-        help="Uses Gemini Vision to read DPD values from coloured payment-history cells "
-             "in scanned CRIF Commercial reports, catches delinquency that OCR misses. "
-             "Adds ~15s and costs ~₹0.17 per report.",
+        "Use Gemini Vision fallback",
+        value=False,
+        help="Off by default - normal rule-based OCR runs first for scanned CRIF Commercial "
+             "reports. Tick this to let Gemini step in when needed: (1) re-extracts accounts "
+             "from page images if OCR fails the report's own summary validation, and "
+             "(2) reads DPD from coloured payment-history cells OCR can't read. "
+             "Adds ~15s and costs ~₹0.17 per report. Re-run extraction after ticking.",
     )
 
 if not (uploaded and run):
@@ -221,9 +229,10 @@ closed   = [a for a in accounts if a["status"] == "Closed"]
 name     = data["name"]
 score    = data["score"]
 
-total_overdue = sum(a["overdue"]         for a in active)
-total_balance = sum(a["current_balance"] for a in active)
-max_dpd_all   = max((a["max_dpd"] for a in accounts), default=0)
+total_overdue = sum(a["overdue"] or 0                       for a in active)
+total_balance = sum(a["current_balance"] or 0               for a in active)
+max_dpd_all   = max((a["max_dpd"] for a in accounts if a["max_dpd"] is not None), default=0)
+unread_dpd    = sum(1 for a in accounts if a["max_dpd"] is None)
 
 # ── Borrower + Score ──────────────────────────────────────────────
 st.divider()
@@ -246,9 +255,13 @@ c5.metric("Total Overdue",   _fmt_inr(total_overdue))
 d1, d2, d3, d4, d5 = st.columns(5)
 d1.metric("Max DPD (ever)",         f"{max_dpd_all} days")
 d2.metric("Accounts w/ Overdue",    sum(1 for a in active   if a["overdue"] > 0))
-d3.metric("Accounts w/ DPD",        sum(1 for a in accounts if a["max_dpd"] > 0))
+d3.metric("Accounts w/ DPD",        sum(1 for a in accounts if (a["max_dpd"] or 0) > 0))
 d4.metric("Avg Active Balance",     _fmt_inr(total_balance // len(active)) if active else "₹0")
-d5.metric("Total Exposure",         _fmt_inr(sum(a["sanction_amount"] for a in active)))
+d5.metric("Total Exposure",         _fmt_inr(sum(a["sanction_amount"] or 0 for a in active)))
+
+if unread_dpd:
+    st.caption(f"⚠️ Max DPD could not be read for **{unread_dpd} account(s)** - shown as "
+               f"\"Check CIBIL\" in the table below.")
 
 st.divider()
 
@@ -258,6 +271,46 @@ with s1:
     _method_badge(data["extraction_method"])
 with s2:
     _validation_badge(data["validation"])
+
+# ── Gemini Vision fallback / enrichment status ────────────────────
+if data.get("vision_fallback_used"):
+    if data["extraction_method"] == METHOD_VISION:
+        st.info("👁️  **Gemini Vision fallback was used** - rule-based OCR failed the "
+                "report's own summary validation, so accounts were re-extracted from page "
+                "images (adopted because it validated better).")
+    else:
+        st.info("👁️  Gemini Vision fallback was tried (OCR had failed validation) but its "
+                "result didn't validate any better, so the rule-based OCR extraction was kept.")
+elif data.get("vision_fallback_recommended"):
+    st.warning(
+        "⚠️  This scanned report **failed summary validation** with normal OCR. "
+        "Tick **\"Use Gemini Vision fallback\"** above and re-run extraction to let "
+        "Gemini re-read the account pages directly."
+    )
+
+if data.get("dpd_vision_used"):
+    pages   = data.get("dpd_vision_pages", [])
+    checked = data.get("dpd_vision_checked", [])
+    patched = data.get("dpd_vision_patched", [])
+    if pages:
+        st.info(
+            f"👁️  **Gemini Vision DPD enrichment was used** for this report  -  "
+            f"sent **{len(pages)} page(s)** ({', '.join(map(str, pages))}) covering "
+            f"**{len(checked)} account(s)** (Sr.No {', '.join(map(str, checked))}) that had "
+            f"0 DPD from OCR"
+            + (f", and corrected **{len(patched)}** of them "
+               f"(Sr.No {', '.join(map(str, patched))})."
+               if patched else ", no additional delinquency was found.")
+        )
+    else:
+        st.info("👁️  Gemini Vision DPD enrichment ran, but every account already had a "
+                "non-zero Max DPD from OCR - nothing to send.")
+elif data.get("dpd_vision_recommended"):
+    st.warning(
+        "⚠️  This is a **scanned report** - OCR can misread DPD in coloured "
+        "payment-history cells. Tick **\"Use Gemini Vision fallback\"** above "
+        "and re-run extraction for more reliable Max DPD values."
+    )
 
 st.divider()
 

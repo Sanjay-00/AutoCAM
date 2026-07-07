@@ -18,6 +18,7 @@ from crif_parser import _is_closed, _extract_balance, _extract_entity
 from crif_commercial_parser import parse_crif_commercial
 from tu_parser   import parse_transunion
 import ocr_extractor
+import html_extractor
 
 # ─────────────────────────────────────────────────────────────────
 # EXTRACTION METHOD LABELS  (imported by app.py)
@@ -38,6 +39,23 @@ def _open_doc(pdf_source) -> "fitz.Document":
         return fitz.open(pdf_source)
     pdf_source.seek(0)
     return fitz.open(stream=pdf_source.read(), filetype="pdf")
+
+
+def _is_html_source(source) -> bool:
+    name = getattr(source, "name", source if isinstance(source, str) else "")
+    if isinstance(name, str) and name.lower().endswith((".html", ".htm")):
+        return True
+    return False
+
+
+def _read_html(source) -> str:
+    if isinstance(source, str):
+        with open(source, "rb") as f:
+            raw = f.read()
+    else:
+        source.seek(0)
+        raw = source.read()
+    return _normalize_text(html_extractor.html_to_text(raw))
 
 
 def _normalize_text(text: str) -> str:
@@ -65,6 +83,8 @@ def _extract(doc, on_progress=None) -> tuple:
 
 def extract_text(pdf_source) -> str:
     """Public helper  -  returns report text (OCR'd if the PDF is scanned)."""
+    if _is_html_source(pdf_source):
+        return _read_html(pdf_source)
     doc = _open_doc(pdf_source)
     try:
         return _extract(doc)[0]
@@ -84,7 +104,8 @@ def _detect_provider(text: str) -> str:
             or "cibil msme rank" in sample or "cmr-" in sample
             or "commercial credit information report" in sample):
         return "transunion"
-    if "commercial ace report" in sample or "perform commercial" in sample:
+    if (re.search(r'commercial\s*ace\W*report', sample) or "perform commercial" in sample
+            or "borrower summary" in sample):
         return "crif_commercial"
     return "crif"
 
@@ -98,7 +119,7 @@ def validate_extraction(accounts: list, reported: dict) -> dict:
     issues  = []
     active  = [a for a in accounts if a.get("status") == "Active"]
     count   = len(active)
-    balance = sum(a.get("current_balance", 0) for a in active)
+    balance = sum(a.get("current_balance") or 0 for a in active)
 
     exp_count = reported.get("account_count")
     exp_bal   = reported.get("total_balance")
@@ -285,29 +306,46 @@ def _find_account_page(acc: dict, page_texts: list) -> int | None:
 
 
 def _enrich_dpd_vision(accounts: list, doc, page_texts: list, api_key: str,
-                       on_progress=None) -> None:
+                       on_progress=None) -> dict:
     """
     For scanned CRIF Commercial PDFs, OCR cannot read text inside coloured
-    (orange/red) payment history cells. This function sends each affected page
-    to Gemini Vision and patches max_dpd on accounts that were 0 from OCR.
-    Mutates accounts in-place; called only when method != METHOD_VISION.
+    (orange/red) payment history cells, and _extract_max_dpd returns None for
+    accounts where it found no readable payment-history pattern at all (shown
+    as "Check CIBIL" rather than a possibly-wrong 0). This function sends each
+    affected page to Gemini Vision and resolves max_dpd on those None accounts.
+    Confident 0-DPD reads from OCR are left untouched - only genuinely unread
+    accounts are sent. Mutates accounts in-place; called only when
+    method != METHOD_VISION.
+
+    Only pages that actually hold an unread (None) account are rendered and
+    sent - not the whole document - to keep this fast and cheap.
 
     Pages are rendered on the main thread (PyMuPDF is not thread-safe) then
     all Gemini API calls run in parallel, turning ~N×10s into ~10s total.
     on_progress(done, total) fires as each Vision call completes.
+
+    Returns a summary dict the caller can show in the UI:
+        pages_sent      - sorted 1-indexed page numbers sent to Gemini
+        accounts_checked- sr_no of every account examined (was None/unread from OCR)
+        accounts_patched- sr_no of accounts whose max_dpd Gemini actually resolved
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # Group zero-DPD accounts by their PDF page
+    # Group accounts whose DPD OCR genuinely couldn't read (None) by PDF page.
+    # Confident 0-DPD reads are trusted as-is and NOT re-checked here.
     page_map: dict[int, list] = {}
     for acc in accounts:
-        if acc.get("max_dpd", 0) == 0:
+        if acc.get("max_dpd") is None:
             pg = _find_account_page(acc, page_texts)
             if pg is not None:
                 page_map.setdefault(pg, []).append(acc)
 
+    summary = {"pages_sent": [], "accounts_checked": [], "accounts_patched": []}
     if not page_map:
-        return
+        return summary
+
+    summary["pages_sent"]       = sorted(pg + 1 for pg in page_map)
+    summary["accounts_checked"] = sorted(acc["sr_no"] for accs in page_map.values() for acc in accs)
 
     # Render all page images on the main thread first
     page_uris = {pg_idx: ocr_extractor._img_data_uri(doc[pg_idx])
@@ -332,22 +370,34 @@ def _enrich_dpd_vision(accounts: list, doc, page_texts: list, api_key: str,
             except Exception:
                 continue
             for acc in page_map[pg_idx]:
-                key = f"{acc['date_of_sanction']}|{acc.get('sanction_amount', 0)}"
-                if key in dpd_map and dpd_map[key] > 0:
+                key = f"{acc['date_of_sanction']}|{acc.get('sanction_amount') or 0}"
+                # Accept whatever Gemini reports, including 0 - these accounts
+                # started as None (unread), so even a confirmed 0 resolves the
+                # uncertainty and is worth recording. Left as None (Check CIBIL)
+                # only if Gemini has no answer for this key at all.
+                if key in dpd_map:
                     acc["max_dpd"] = dpd_map[key]
+                    summary["accounts_patched"].append(acc["sr_no"])
+
+    summary["accounts_patched"].sort()
+    return summary
 
 
 def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
                            on_dpd_progress=None, enrich_dpd: bool = True) -> dict:
     """
-    CRIF Commercial ACE path. Rule-based on the (possibly OCR'd) text; when the
-    source was scanned and the parse fails the report's summary validation, fall
-    back to Gemini Vision on the targeted account pages  -  but only adopt the
-    Vision result if it validates at least as well as the OCR result.
+    CRIF Commercial ACE path. Rule-based on the (possibly OCR'd) text is always
+    the default for scanned reports - Gemini (both the full-account Vision
+    fallback and the DPD colour-cell enrichment) only runs when the caller
+    opts in via `enrich_dpd` (the "Enrich DPD via Vision (Gemini)" checkbox in
+    the UI). If validation fails on a scanned report and the user hasn't opted
+    in, we surface a recommendation instead of silently calling Gemini.
 
-    A second Vision pass (_enrich_dpd_vision) always runs for scanned PDFs with
-    an api_key: it corrects max_dpd on accounts where OCR returned 0 by reading
-    coloured payment-history cells directly from the page image.
+    When opted in: if the parse fails the report's summary validation, fall
+    back to Gemini Vision on the targeted account pages - but only adopt the
+    Vision result if it validates at least as well as the OCR result. Then a
+    second Vision pass (_enrich_dpd_vision) corrects max_dpd on accounts where
+    OCR returned 0, by reading coloured payment-history cells from the image.
     on_dpd_progress(done, total) fires after each page Vision call completes.
     """
     name, score, blocks, accounts, reported = parse_crif_commercial(text)
@@ -356,7 +406,13 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
     method     = METHOD_OCR if scanned else METHOD_RULE_BASED
     validation = validate_extraction(accounts, reported)
 
-    if not validation["valid"] and scanned and api_key:
+    # Recommend the Gemini fallback rather than using it automatically - only
+    # runs once the user has ticked the checkbox (enrich_dpd).
+    vision_fallback_recommended = not validation["valid"] and scanned and bool(api_key)
+    vision_fallback_used        = False
+
+    if vision_fallback_recommended and enrich_dpd:
+        vision_fallback_used = True
         pages = ocr_extractor.select_pages(page_texts) if page_texts else []
         vis = ocr_extractor.vision_extract_accounts(
             doc, pages, api_key,
@@ -370,22 +426,37 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
 
     # DPD enrichment: runs even when validation passed; skipped if Vision already
     # extracted the full account set (which includes DPD from the image).
-    if enrich_dpd and scanned and api_key and page_texts and method != METHOD_VISION:
-        _enrich_dpd_vision(accounts, doc, page_texts, api_key,
-                           on_progress=on_dpd_progress)
+    # dpd_vision_recommended flags reports that actually have unread (None) DPD
+    # accounts worth resolving via Gemini - lets the UI nudge the user only when
+    # there's really something to check, not on every scanned report.
+    has_unread_dpd = any(a.get("max_dpd") is None for a in accounts)
+    dpd_vision_recommended = scanned and bool(api_key) and method != METHOD_VISION and has_unread_dpd
+    dpd_vision_used        = False
+    dpd_vision_summary     = {"pages_sent": [], "accounts_checked": [], "accounts_patched": []}
+    if enrich_dpd and dpd_vision_recommended and page_texts:
+        dpd_vision_used    = True
+        dpd_vision_summary = _enrich_dpd_vision(accounts, doc, page_texts, api_key,
+                                                on_progress=on_dpd_progress)
 
     return {
-        "name":              name,
-        "score":             score,
-        "accounts":          accounts,
-        "extraction_method": method,
-        "validation":        validation,
-        "provider":          "crif_commercial",
+        "name":                   name,
+        "score":                  score,
+        "accounts":               accounts,
+        "extraction_method":      method,
+        "validation":             validation,
+        "provider":               "crif_commercial",
+        "vision_fallback_recommended": vision_fallback_recommended,
+        "vision_fallback_used":        vision_fallback_used,
+        "dpd_vision_recommended": dpd_vision_recommended,
+        "dpd_vision_used":        dpd_vision_used,
+        "dpd_vision_pages":       dpd_vision_summary["pages_sent"],
+        "dpd_vision_checked":     dpd_vision_summary["accounts_checked"],
+        "dpd_vision_patched":     dpd_vision_summary["accounts_patched"],
     }
 
 
 def parse(pdf_source, api_key: str = None, on_progress=None,
-          on_dpd_progress=None, enrich_dpd: bool = True) -> dict:
+          on_dpd_progress=None, enrich_dpd: bool = False) -> dict:
     """
     Parse a CIBIL PDF (CRIF retail, CRIF Commercial, or TransUnion) and return
     structured data. Scanned PDFs are OCR'd first.
@@ -393,71 +464,88 @@ def parse(pdf_source, api_key: str = None, on_progress=None,
     on_progress(current_page, total_pages) is called during OCR if provided.
     on_dpd_progress(done, total) is called during Vision DPD enrichment (CRIF
     Commercial scanned only).
-    enrich_dpd: set False to skip Vision DPD enrichment (faster, no API cost).
+    enrich_dpd: CRIF Commercial only, opt-in (default False). Rule-based OCR
+    is always tried first; Gemini is never called unless this is True - the
+    UI surfaces `vision_fallback_recommended` / `dpd_vision_recommended` in
+    the result so the user can decide whether to re-run with it enabled.
+    HTML sources (.html/.htm) are supported too  -  they carry embedded text
+    (like a digital PDF) with no OCR/Vision path, since there's no PDF page to
+    render.
 
     Returns dict:
         name, score, accounts, extraction_method, validation, provider
     """
+    if _is_html_source(pdf_source):
+        text, scanned, page_texts, doc = _read_html(pdf_source), False, None, None
+        return _parse_text(text, scanned, page_texts, doc, api_key,
+                           on_dpd_progress=on_dpd_progress, enrich_dpd=enrich_dpd)
+
     doc = _open_doc(pdf_source)
     try:
         text, scanned, page_texts = _extract(doc, on_progress=on_progress)
-        provider = _detect_provider(text)
+        return _parse_text(text, scanned, page_texts, doc, api_key,
+                           on_dpd_progress=on_dpd_progress, enrich_dpd=enrich_dpd)
+    finally:
+        doc.close()
 
-        # ── TransUnion path ───────────────────────────────────────
-        if provider == "transunion":
-            name, score, accounts, reported, validation = parse_transunion(text)
-            _renumber(accounts)
-            return {
-                "name":              name,
-                "score":             score,
-                "accounts":          accounts,
-                "extraction_method": METHOD_OCR if scanned else METHOD_RULE_BASED,
-                "validation":        validation,
-                "provider":          "transunion",
-            }
 
-        # ── CRIF Commercial ACE path ──────────────────────────────
-        if provider == "crif_commercial":
-            return _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
-                                          on_dpd_progress=on_dpd_progress,
-                                          enrich_dpd=enrich_dpd)
+def _parse_text(text, scanned, page_texts, doc, api_key,
+                on_dpd_progress=None, enrich_dpd: bool = True) -> dict:
+    provider = _detect_provider(text)
 
-        # ── CRIF retail path ──────────────────────────────────────
-        name, score, blocks, accounts, reported = parse_crif(text)
+    # ── TransUnion path ───────────────────────────────────────
+    if provider == "transunion":
+        name, score, accounts, reported, validation = parse_transunion(text)
         _renumber(accounts)
-
-        extraction_method = METHOD_OCR if scanned else METHOD_RULE_BASED
-        validation        = validate_extraction(accounts, reported)
-
-        # Stage 2: LLM block-fix
-        if not validation["valid"] and api_key:
-            fixed, ok = _llm_fix_blocks(blocks, accounts, api_key)
-            if ok:
-                _renumber(fixed)
-                v2 = validate_extraction(fixed, reported)
-                if v2["valid"]:
-                    accounts          = fixed
-                    extraction_method = METHOD_LLM_CORRECTION
-                    validation        = v2
-                else:
-                    # Stage 3: Full-PDF LLM
-                    full, ok2 = _llm_full(text, api_key, reported.get("account_count"))
-                    if ok2 and full:
-                        _renumber(full)
-                        accounts          = full
-                        extraction_method = METHOD_LLM_FULL
-                        validation        = validate_extraction(accounts, reported)
-
         return {
             "name":              name,
             "score":             score,
             "accounts":          accounts,
-            "extraction_method": extraction_method,
+            "extraction_method": METHOD_OCR if scanned else METHOD_RULE_BASED,
             "validation":        validation,
-            "provider":          "crif",
+            "provider":          "transunion",
         }
-    finally:
-        doc.close()
+
+    # ── CRIF Commercial ACE path ──────────────────────────────
+    if provider == "crif_commercial":
+        return _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
+                                      on_dpd_progress=on_dpd_progress,
+                                      enrich_dpd=enrich_dpd)
+
+    # ── CRIF retail path ──────────────────────────────────────
+    name, score, blocks, accounts, reported = parse_crif(text)
+    _renumber(accounts)
+
+    extraction_method = METHOD_OCR if scanned else METHOD_RULE_BASED
+    validation        = validate_extraction(accounts, reported)
+
+    # Stage 2: LLM block-fix
+    if not validation["valid"] and api_key:
+        fixed, ok = _llm_fix_blocks(blocks, accounts, api_key)
+        if ok:
+            _renumber(fixed)
+            v2 = validate_extraction(fixed, reported)
+            if v2["valid"]:
+                accounts          = fixed
+                extraction_method = METHOD_LLM_CORRECTION
+                validation        = v2
+            else:
+                # Stage 3: Full-PDF LLM
+                full, ok2 = _llm_full(text, api_key, reported.get("account_count"))
+                if ok2 and full:
+                    _renumber(full)
+                    accounts          = full
+                    extraction_method = METHOD_LLM_FULL
+                    validation        = validate_extraction(accounts, reported)
+
+    return {
+        "name":              name,
+        "score":             score,
+        "accounts":          accounts,
+        "extraction_method": extraction_method,
+        "validation":        validation,
+        "provider":          "crif",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────

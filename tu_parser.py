@@ -86,12 +86,28 @@ def extract_totals(text: str) -> dict:
     section = text[m.start(): m.start() + 3000]
 
     cf_counts = [int(x) for x in re.findall(r"Total CF.s\s*:\s*(\d+)", section)]
-    bal_vals  = [_to_int(x) for x in re.findall(r"₹([\d,]+)\(100%\)", section)]
-
     if cf_counts:
         totals["account_count"] = max(cf_counts)
+
+    # Some TU formats show a single total as ₹X(100%)
+    bal_vals = [_to_int(x) for x in re.findall(r"₹([\d,]+)\(100%\)", section)]
     if bal_vals:
         totals["total_balance"] = max(bal_vals)
+    else:
+        # Other TU formats (3-column layout: YOUR INSTITUTION | TOTAL | OUTSIDE) split
+        # the TOTAL outstanding into two ₹X(N%) amounts (non-delinquent + delinquent).
+        # The TOTAL block starts with "TOTAL" on its own line followed by "Total Lenders".
+        m2 = re.search(r"\bTOTAL\b\s*\nTotal Lenders\s*:\s*\d+\n", section)
+        if m2:
+            # Limit to the TOTAL block only — stop before the next "Total Lenders" line
+            # (which starts the OUTSIDE column data in the 3-column layout).
+            next_tl = section.find("Total Lenders", m2.end())
+            end = next_tl if next_tl > m2.end() else m2.start() + 500
+            total_block = section[m2.start(): end]
+            pct_amounts = [_to_int(x) for x in re.findall(r"₹([\d,]+)\(\d+%\)", total_block)]
+            if pct_amounts:
+                totals["total_balance"] = sum(pct_amounts)
+
     return totals
 
 
@@ -169,9 +185,18 @@ def _extract_account(cf_num: int, block: str, ownership: str = "Borrower") -> di
         m = re.search(r"AMOUNTS.*?DATES.*?(\d{2}-[A-Z]{3}-\d{4})", block, re.DOTALL)
     date_val = _tu_date(m.group(1)) if m else "NA"
 
-    # Loan type (line after 'Credit Facility N')
-    m = re.search(r"Credit Facility\s+\d+\s*\n([^\n]+)", block)
-    loan_type = m.group(1).strip().title() if m else "Unknown"
+    # Loan type (line(s) after 'Credit Facility N')
+    m = re.search(r"Credit Facility\s+\d+\s*\n([^\n]+)(?:\n([^\n]+))?", block)
+    if m:
+        line1 = m.group(1).strip()
+        line2 = (m.group(2) or "").strip()
+        # Join second line only when first line has an unclosed parenthesis
+        if line2 and line1.count("(") > line1.count(")"):
+            loan_type = (line1 + " " + line2).title()
+        else:
+            loan_type = line1.title()
+    else:
+        loan_type = "Unknown"
 
     # Entity
     m = re.search(r"MEMBER\s*:\s*\n([^\n]+)", block)
