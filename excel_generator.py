@@ -202,10 +202,10 @@ def generate_excel(data: dict) -> bytes:
         # Alternating row background
         row_bg = _fill(LIGHT_GREY) if idx % 2 == 1 else _fill(ALT_WHITE)
 
-        # DPD-based background override
-        dpd = acc.get("max_dpd", 0)
+        # DPD value used for gradient colouring when it's a confident read
+        dpd_raw = acc.get("max_dpd")
         try:
-            dpd = int(dpd)
+            dpd = int(dpd_raw)
         except (TypeError, ValueError):
             dpd = 0
 
@@ -214,17 +214,25 @@ def generate_excel(data: dict) -> bytes:
         # Try to parse date for proper Excel date type
         date_cell_val = _parse_date(date_val)
 
+        # None signals OCR read failure — shown as "Check CIBIL" in output
+        _CHECK = "Check CIBIL"
+        sanction_val = acc.get("sanction_amount")
+        balance_val  = acc.get("current_balance")
+        sanction_cell = _CHECK if sanction_val is None else sanction_val
+        balance_cell  = _CHECK if balance_val  is None else balance_val
+        dpd_cell      = _CHECK if dpd_raw     is None else dpd
+
         row_values = [
             acc.get("sr_no", idx + 1),
             date_cell_val,
-            acc.get("sanction_amount", 0),
-            acc.get("current_balance", 0),
+            sanction_cell,
+            balance_cell,
             acc.get("emi", 0),
             acc.get("overdue", 0),
             acc.get("entity", "XXXX"),
             acc.get("ownership", ""),
             acc.get("type_of_loan", ""),
-            dpd,
+            dpd_cell,
             acc.get("status", "Active"),
         ]
 
@@ -246,11 +254,15 @@ def generate_excel(data: dict) -> bytes:
                     cell.number_format = "DD-MMM-YYYY"
 
             elif col_idx in (3, 4, 5, 6):   # Amount columns
-                cell.fill          = row_bg
-                cell.font          = _f()
-                cell.alignment     = _a("right")
-                # Indian number format
-                cell.number_format = '#,##0;-#,##0;"-"'
+                if value == _CHECK:
+                    cell.fill      = _fill("FFF2CC")   # amber tint
+                    cell.font      = _f(italic=True, color="7F6000", bold=True)
+                    cell.alignment = _a("center")
+                else:
+                    cell.fill          = row_bg
+                    cell.font          = _f()
+                    cell.alignment     = _a("right")
+                    cell.number_format = '#,##0;-#,##0;"-"'
 
             elif col_idx == 7:   # Entity
                 cell.fill      = row_bg
@@ -268,14 +280,19 @@ def generate_excel(data: dict) -> bytes:
                 cell.alignment = _a("left", wrap=True)
 
             elif col_idx == 10:   # Max DPD - gradient colour
-                bg, fg = _dpd_style(dpd)
-                if bg is None:          # 1-30: plain
-                    cell.fill = row_bg
-                    cell.font = _f()
+                if value == _CHECK:
+                    cell.fill      = _fill("FFF2CC")   # amber tint
+                    cell.font      = _f(italic=True, color="7F6000", bold=True)
+                    cell.alignment = _a("center")
                 else:
-                    cell.fill = _fill(bg)
-                    cell.font = _f(color=fg, bold=True)
-                cell.alignment = _a("center")
+                    bg, fg = _dpd_style(dpd)
+                    if bg is None:          # 1-30: plain
+                        cell.fill = row_bg
+                        cell.font = _f()
+                    else:
+                        cell.fill = _fill(bg)
+                        cell.font = _f(color=fg, bold=True)
+                    cell.alignment = _a("center")
 
             elif col_idx == 11:   # Status
                 cell.fill = row_bg

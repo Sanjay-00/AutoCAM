@@ -516,12 +516,39 @@ def build_positional_lists(text: str) -> tuple:
     return at_list, cg_list
 
 
+def build_positional_dpd(text: str) -> list:
+    """
+    Max DPD per 'Account Type:' label, scanning the text between one label and
+    the next (not the account block). Some CRIF layouts print the compact
+    summary's Payment History grid for ALL accounts before the detailed blocks,
+    with the 'Payment History/Asset Classification:' label trailing the grid
+    instead of preceding it  -  in that layout _extract_max_dpd's block-relative
+    "scan after the label" search throws the grid away entirely. Anchoring on
+    the 'Account Type:' labels (same anchors as build_positional_lists) instead
+    isolates each account's own grid regardless of where the label falls.
+    """
+    labels = list(re.finditer(r'Account Type:', text))
+    result = []
+    for i, m in enumerate(labels):
+        start   = m.end()
+        end     = labels[i + 1].start() if i + 1 < len(labels) else len(text)
+        segment = text[start:end]
+        vals    = [
+            int(num)
+            for num, cls in re.findall(r'(?<!\d)(\d{1,3})\s*/\s*([A-Za-z]{2,3})', segment)
+            if cls.upper() not in _DPD_FREQ and int(num) < 900
+        ]
+        result.append(max(vals) if vals else 0)
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────
 # ACCOUNT EXTRACTION
 # ─────────────────────────────────────────────────────────────────
 
 def extract_account(acct_num: int, block: str,
-                    loan_type: str = None, entity: str = None) -> dict:
+                    loan_type: str = None, entity: str = None,
+                    max_dpd: int = None) -> dict:
     return {
         "sr_no":            acct_num,
         "date_of_sanction": _extract_date(block),
@@ -532,7 +559,7 @@ def extract_account(acct_num: int, block: str,
         "entity":           entity if entity else _extract_entity(block),
         "ownership":        _extract_ownership(block),
         "type_of_loan":     loan_type if loan_type else _extract_loan_type(block),
-        "max_dpd":          _extract_max_dpd(block),
+        "max_dpd":          max(max_dpd, _extract_max_dpd(block)) if max_dpd is not None else _extract_max_dpd(block),
         "status":           "Closed" if _is_closed(block) else "Active",
     }
 
@@ -561,6 +588,9 @@ def parse_crif(text: str) -> tuple:
     at_ok = len(at_list) == len(blocks)
     cg_ok = len(cg_list) == len(blocks)
 
+    dpd_list = build_positional_dpd(text)
+    dpd_ok   = len(dpd_list) == len(blocks)
+
     accounts = []
     for idx, (num, blk) in enumerate(blocks):
         lt = at_list[idx] if at_ok else None
@@ -569,7 +599,8 @@ def parse_crif(text: str) -> tuple:
             lt = _extract_loan_type(blk)
         if not en or en == "NA":
             en = _extract_entity(blk)
-        accounts.append(extract_account(num, blk, lt, en))
+        dp = dpd_list[idx] if dpd_ok else None
+        accounts.append(extract_account(num, blk, lt, en, dp))
 
     accounts.sort(key=lambda x: x["sr_no"])
     return name, score, blocks, accounts, reported

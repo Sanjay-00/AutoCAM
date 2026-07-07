@@ -329,7 +329,10 @@ _VISION_PROMPT = (
     "- entity = the 'Lender' value (use \"Not Disclosed\" if masked as XXXX).\n"
     "- type_of_loan = the 'Type' value.\n"
     "- max_dpd = worst days-past-due in the Payment History grid; 0 if every "
-    "entry is Standard/STD.\n"
+    "entry is Standard/STD. Colour is a cross-check: cells are only coloured "
+    "(orange shifting to red as the number grows) when DPD > 30 - an uncoloured "
+    "cell can still be a small non-zero DPD (1-30), but a coloured cell must read "
+    "as a number > 30, so re-check if your first read of a coloured cell is <= 30.\n"
     "- status = 'Closed' if Closure Reason is WRITTEN OFF / SETTLED / CLOSED or a "
     "Closed Date is present, else 'Active'.\n"
     "Amounts as plain integers in rupees (no commas/symbols). Use 0 when blank or "
@@ -349,8 +352,13 @@ import re as _re
 _DPD_PAGE_PROMPT = """\
 This page is from a CRIF High Mark COMMERCIAL ACE credit report.
 The Payment History/Asset Classification table shows cells like "NNN/xxx" where NNN = days \
-past due (e.g. "033/xxx" → 33 DPD, "000/xxx" → 0 DPD, "546/xxx" → 546 DPD). \
-Coloured cells (orange/red) mean non-zero DPD — read the number carefully even inside coloured cells.
+past due (e.g. "033/xxx" → 33 DPD, "000/xxx" → 0 DPD, "546/xxx" → 546 DPD).
+
+Colour is a strong cross-check: cells are only coloured when DPD is GREATER THAN 30, and the \
+colour shifts from orange (just over 30) to deep red (very high DPD) as the number increases. \
+Uncoloured cells can still have a small non-zero DPD (1-30) - don't assume uncoloured means zero. \
+But a coloured cell must read as a number > 30: if your first read of a coloured cell comes out \
+<= 30, look again, since that combination is inconsistent with the report's own colour convention.
 
 For EACH account listed below (identified by Sanctioned Date and Sanctioned Amount), \
 find its Payment History grid and return the MAXIMUM NNN value across all months.
