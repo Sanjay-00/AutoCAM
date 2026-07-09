@@ -11,9 +11,6 @@ Public API (unchanged):
 
 import re
 import json
-import csv
-import os
-from datetime import datetime, timezone
 import fitz  # PyMuPDF
 
 from crif_parser import parse_crif, extract_reported_totals, split_account_blocks
@@ -458,62 +455,6 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
     }
 
 
-_USAGE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "usage_log.csv")
-_USAGE_LOG_FIELDS = [
-    "timestamp", "filename", "provider", "extraction_method", "valid",
-    "scanned", "api_key_present", "enrich_dpd_checked",
-    "vision_fallback_recommended", "vision_fallback_used",
-    "dpd_vision_recommended", "dpd_vision_used",
-    "dpd_vision_pages_count", "dpd_vision_checked_count", "dpd_vision_patched_count",
-]
-
-
-def _source_name(pdf_source) -> str:
-    name = getattr(pdf_source, "name", None)
-    if name:
-        return os.path.basename(str(name))
-    if isinstance(pdf_source, str):
-        return os.path.basename(pdf_source)
-    return "unknown"
-
-
-def _log_usage(pdf_source, result: dict, api_key: str, scanned: bool, enrich_dpd: bool) -> None:
-    """
-    Append one row per parse() call to logs/usage_log.csv - tracks whether the
-    Gemini Vision fallback / DPD enrichment actually fired, and why, so real
-    usage patterns (e.g. the checkbox being left on out of habit on reports
-    that don't need it) can be reviewed without a paid tracing service.
-    Never raises - logging must not break extraction.
-    """
-    try:
-        os.makedirs(os.path.dirname(_USAGE_LOG_PATH), exist_ok=True)
-        is_new = not os.path.exists(_USAGE_LOG_PATH)
-        row = {
-            "timestamp":                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "filename":                     _source_name(pdf_source),
-            "provider":                     result.get("provider"),
-            "extraction_method":            result.get("extraction_method"),
-            "valid":                        result.get("validation", {}).get("valid"),
-            "scanned":                      scanned,
-            "api_key_present":              bool(api_key),
-            "enrich_dpd_checked":           enrich_dpd,
-            "vision_fallback_recommended":  result.get("vision_fallback_recommended", False),
-            "vision_fallback_used":         result.get("vision_fallback_used", False),
-            "dpd_vision_recommended":       result.get("dpd_vision_recommended", False),
-            "dpd_vision_used":              result.get("dpd_vision_used", False),
-            "dpd_vision_pages_count":       len(result.get("dpd_vision_pages", []) or []),
-            "dpd_vision_checked_count":     len(result.get("dpd_vision_checked", []) or []),
-            "dpd_vision_patched_count":     len(result.get("dpd_vision_patched", []) or []),
-        }
-        with open(_USAGE_LOG_PATH, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=_USAGE_LOG_FIELDS)
-            if is_new:
-                writer.writeheader()
-            writer.writerow(row)
-    except OSError:
-        pass
-
-
 def parse(pdf_source, api_key: str = None, on_progress=None,
           on_dpd_progress=None, enrich_dpd: bool = False) -> dict:
     """
@@ -536,18 +477,14 @@ def parse(pdf_source, api_key: str = None, on_progress=None,
     """
     if _is_html_source(pdf_source):
         text, scanned, page_texts, doc = _read_html(pdf_source), False, None, None
-        result = _parse_text(text, scanned, page_texts, doc, api_key,
-                             on_dpd_progress=on_dpd_progress, enrich_dpd=enrich_dpd)
-        _log_usage(pdf_source, result, api_key, scanned, enrich_dpd)
-        return result
+        return _parse_text(text, scanned, page_texts, doc, api_key,
+                           on_dpd_progress=on_dpd_progress, enrich_dpd=enrich_dpd)
 
     doc = _open_doc(pdf_source)
     try:
         text, scanned, page_texts = _extract(doc, on_progress=on_progress)
-        result = _parse_text(text, scanned, page_texts, doc, api_key,
-                             on_dpd_progress=on_dpd_progress, enrich_dpd=enrich_dpd)
-        _log_usage(pdf_source, result, api_key, scanned, enrich_dpd)
-        return result
+        return _parse_text(text, scanned, page_texts, doc, api_key,
+                           on_dpd_progress=on_dpd_progress, enrich_dpd=enrich_dpd)
     finally:
         doc.close()
 
