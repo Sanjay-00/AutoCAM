@@ -187,14 +187,8 @@ _INFO_MARKER  = re.compile(r'Info\.?\s*as\s*of\s*:',       re.IGNORECASE)
 _HEADER_DEDUP = 120   # Terms-For and Info-as-of co-occur within ~40 chars on one line
 
 
-def split_account_blocks(text: str) -> list:
-    """
-    Each detailed account ('Account Trade History') begins at its header line.
-    Anchor on 'Loan Terms For' OR 'Info. as of' (whichever OCR preserved) and
-    de-duplicate the two tokens that share a single header line. This recovers
-    accounts whose 'Terms For' header was mangled by OCR (e.g. on long reports).
-    Returns list of (ordinal: int, block_text: str).
-    """
+def _group_starts(text: str) -> list:
+    """Start positions of each 'Loan Terms For' group (see split_account_blocks)."""
     cands = sorted([m.start() for m in _BLOCK_MARKER.finditer(text)]
                    + [m.start() for m in _INFO_MARKER.finditer(text)])
     if not cands:
@@ -203,6 +197,20 @@ def split_account_blocks(text: str) -> list:
     for p in cands[1:]:
         if p - starts[-1] > _HEADER_DEDUP:
             starts.append(p)
+    return starts
+
+
+def split_account_blocks(text: str) -> list:
+    """
+    Each detailed account ('Account Trade History') begins at its header line.
+    Anchor on 'Loan Terms For' OR 'Info. as of' (whichever OCR preserved) and
+    de-duplicate the two tokens that share a single header line. This recovers
+    accounts whose 'Terms For' header was mangled by OCR (e.g. on long reports).
+    Returns list of (ordinal: int, block_text: str).
+    """
+    starts = _group_starts(text)
+    if not starts:
+        return []
     blocks = []
     for i, start in enumerate(starts):
         end = starts[i + 1] if i + 1 < len(starts) else len(text)
@@ -460,6 +468,46 @@ _HTML_STATUS_BADGE = re.compile(
     r'Info\.?\s*as\s*\n?\s*of\s*:\s*\d{2}-\d{2}-\d{4}\s*\n?\s*(ACTIVE|CLOSED)\b'
 )
 
+# Some digital-HTML layouts don't render the status badge adjacent to 'Info.
+# as of:' at all (see _HTML_STATUS_BADGE) - instead every trade under one
+# 'Loan Terms For' group gets a bare 'ACTIVE'/'CLOSED' line, but ALL of that
+# group's badges are rendered together at the END of the group's span (after
+# its last trade's fields), not one immediately after each trade. Within a
+# group, badge count always matches trade count and both are in the same
+# document order, so they can be zipped 1:1 per group even though neither
+# split_account_blocks nor split_trade_blocks separates the trades any other
+# way.
+_STATUS_BADGE_LINE = re.compile(r'^\s*(CLOSED|ACTIVE)\s*$', re.MULTILINE)
+
+
+def _positional_trade_status(text: str, trade_starts: list) -> dict:
+    """
+    Maps trade index (0-based, matching `trade_starts` order) -> 'Active' /
+    'Closed' using per-group badge positions (see module note above). A group
+    whose trade count doesn't match its badge count (including zero badges -
+    layouts using the adjacent-badge format instead) contributes nothing;
+    callers keep using _is_closed()'s rule-based fallback for those trades.
+    """
+    if not trade_starts:
+        return {}
+    badges = [(m.start(), m.group(1).title()) for m in _STATUS_BADGE_LINE.finditer(text)]
+    if not badges:
+        return {}
+
+    group_starts = _group_starts(text)
+    if not group_starts:
+        return {}
+
+    result = {}
+    for g, gstart in enumerate(group_starts):
+        gend = group_starts[g + 1] if g + 1 < len(group_starts) else len(text)
+        trades_here = [i for i, t in enumerate(trade_starts) if gstart <= t < gend]
+        badges_here = [s for p, s in badges if gstart <= p < gend]
+        if trades_here and len(trades_here) == len(badges_here):
+            for ti, status in zip(trades_here, badges_here):
+                result[ti] = status
+    return result
+
 
 def _is_closed(block: str, current_balance: int = None) -> bool:
     # Rule 0 (primary): the bureau's own colour-coded status strip. For scanned
@@ -545,39 +593,86 @@ def extract_account(ordinal: int, block: str) -> dict:
 # MAIN PARSE  (called by parser.py orchestrator)
 # ─────────────────────────────────────────────────────────────────
 
+def _is_phantom(a: dict) -> bool:
+    """Digital PDFs produce orphan fragments (balance-history columns split off
+    by a repeated 'Loan Terms For' page header) with no extractable date,
+    sanction amount, or balance — not real accounts."""
+    return a["date_of_sanction"] == "NA" and a["sanction_amount"] == 0 and a["current_balance"] == 0
+
+
+def _expand_account_blocks(text: str, trade_starts: list, status_map: dict) -> tuple:
+    """
+    Per-group account extraction that fixes the case where a page break
+    rendered 2+ trades' data inside a single 'Loan Terms For' group (see
+    _positional_trade_status) — extract_account()'s regex fields only match
+    the FIRST occurrence in a block, so a naive whole-group extraction
+    silently drops every trade after the first. Groups with exactly one
+    trade (the common case) are extracted from the whole group span exactly
+    as before. Groups with more than one trade are expanded into one dict
+    per trade, each sliced from its own 'Type:' marker to the next one
+    anywhere in the document (matching split_trade_blocks), with ownership
+    backfilled from the shared group header and status resolved from
+    status_map when available.
+    Returns (blocks, accounts) - blocks as (ordinal, block_text) pairs.
+    """
+    group_starts = _group_starts(text)
+    blocks, accounts, ordinal = [], [], 0
+    for g, gstart in enumerate(group_starts):
+        gend = group_starts[g + 1] if g + 1 < len(group_starts) else len(text)
+        trades_here = [i for i, t in enumerate(trade_starts) if gstart <= t < gend]
+        if len(trades_here) <= 1:
+            ordinal += 1
+            blk = text[gstart:gend]
+            a = extract_account(ordinal, blk)
+            if trades_here and trades_here[0] in status_map:
+                a["status"] = status_map[trades_here[0]]
+            blocks.append((ordinal, blk))
+            accounts.append(a)
+            continue
+        for ti in trades_here:
+            ordinal += 1
+            t_start = trade_starts[ti]
+            t_end   = trade_starts[ti + 1] if ti + 1 < len(trade_starts) else len(text)
+            blk = text[t_start:t_end]
+            a = extract_account(ordinal, blk)
+            if not a["ownership"]:
+                a["ownership"] = _ownership_before(text, t_start)
+            if ti in status_map:
+                a["status"] = status_map[ti]
+            blocks.append((ordinal, blk))
+            accounts.append(a)
+    return blocks, accounts
+
+
 def parse_crif_commercial(text: str) -> tuple:
     """Returns (name, score, blocks, accounts, reported_totals)."""
     name     = extract_name(text)
     score    = extract_score(text)
     reported = extract_reported_totals(text)
-    blocks   = split_account_blocks(text)
-    accounts = [extract_account(num, blk) for num, blk in blocks]
-    # Drop phantom blocks: digital PDFs produce orphan fragments (balance-history
-    # columns split off by a repeated "Loan Terms For" page header) that have no
-    # extractable date, sanction amount, or balance — not real accounts.
-    accounts = [a for a in accounts
-                if not (a["date_of_sanction"] == "NA"
-                        and a["sanction_amount"] == 0
-                        and a["current_balance"] == 0)]
 
-    # 'Loan Terms For:' blocks can still misattribute accounts even when the
-    # block count happens to match the 'Type:' trade-entry count (see
-    # split_trade_blocks) — always compare both splits against the report's own
-    # totals and keep whichever is closer, the same way parser.py picks between
-    # OCR and Vision extraction.
     trade_starts = [m.start() for m in _TRADE_MARKER.finditer(text)]
+    status_map   = _positional_trade_status(text, trade_starts)
+
+    blocks, accounts = _expand_account_blocks(text, trade_starts, status_map)
+    accounts = [a for a in accounts if not _is_phantom(a)]
+
+    # 'Loan Terms For:' blocks can still misattribute accounts even after the
+    # merged-group expansion above (e.g. a layout where account-format's own
+    # grouping doesn't line up with trades at all) — always compare against
+    # the pure 'Type:'-anchored trade split and keep whichever is closer to
+    # the report's own totals, the same way parser.py picks between OCR and
+    # Vision extraction.
     trade_blocks = split_trade_blocks(text)
     if trade_blocks:
         trade_accounts = []
-        for (num, blk), start in zip(trade_blocks, trade_starts):
+        for i, ((num, blk), start) in enumerate(zip(trade_blocks, trade_starts)):
             a = extract_account(num, blk)
             if not a["ownership"]:
                 a["ownership"] = _ownership_before(text, start)
+            if i in status_map:
+                a["status"] = status_map[i]
             trade_accounts.append(a)
-        trade_accounts = [a for a in trade_accounts
-                          if not (a["date_of_sanction"] == "NA"
-                                  and a["sanction_amount"] == 0
-                                  and a["current_balance"] == 0)]
+        trade_accounts = [a for a in trade_accounts if not _is_phantom(a)]
         if trade_accounts and _quality(trade_accounts, reported) < _quality(accounts, reported):
             blocks, accounts = trade_blocks, trade_accounts
 

@@ -237,6 +237,23 @@ def split_account_blocks(text: str) -> list:
         found_positions.add(pos)
 
     deduped.sort(key=lambda x: x[0])
+
+    # Merge consecutive entries that share the same account number - a real
+    # account whose header lands right at a page bottom sometimes prints just
+    # a stub (number + a couple of fields) before the page cuts it off, then
+    # reprints its own number at the top of the next page followed by the
+    # rest of its fields (this is exactly what Pass 3 is built to catch).
+    # That reprint isn't a new account; keeping both entries would count the
+    # same account twice. CRIF account numbers are unique per report, so any
+    # adjacent duplicate is this continuation pattern, not a coincidence -
+    # drop the second entry and let the merged block span both halves.
+    merged = [deduped[0]]
+    for pos, num in deduped[1:]:
+        if num == merged[-1][1]:
+            continue
+        merged.append((pos, num))
+    deduped = merged
+
     blocks = []
     for i, (start_pos, acct_num) in enumerate(deduped):
         end_pos = deduped[i + 1][0] if i + 1 < len(deduped) else len(text)
@@ -285,20 +302,53 @@ def _extract_date(block: str) -> str:
     return "NA"
 
 
-def _extract_sanction_amt(block: str) -> int:
+# Known CRIF field labels  -  used to detect the "value vanished at a browser
+# print page-break" signature: a label whose very next line is itself one of
+# these labels (instead of a value) means the real value was swallowed by the
+# page break (same root cause as split_account_blocks' Pass 3), not that the
+# field is genuinely blank. Fields that are legitimately blank most of the
+# time (Credit Limit, Cash Limit, Write off Date, ...) print no value line at
+# all rather than skipping straight to the next label, so this check doesn't
+# false-positive on them.
+_KNOWN_LABELS = {
+    "Account Type:", "Credit Grantor:", "Account #:", "Lender Type:", "Ownership:",
+    "Disbursed Date:", "Disbd Amt/High Credit:", "Credit Limit:", "Last Payment Date:",
+    "Current Balance:", "Cash Limit:", "Closed Date:", "Last Paid Amt:", "InstlAmt/Freq:",
+    "Tenure(month):", "Overdue Amt:", "Write off Date:", "Account in Dispute:",
+    "Account Remarks:", "Income/Freq:", "Principal Writeoff Amt", "Settlement Amt:",
+    "Interest Rate:", "Total Writeoff Amt:", "Occupation:",
+    "Payment History/Asset Classification:", "Collateral/Security Details:",
+}
+
+
+def _value_swallowed(block: str, label: str) -> bool:
+    """True when `label`'s value line was eaten by a page break (the next
+    non-blank line is itself a known field label, not a value)."""
+    return _next_line_value(block, label) in _KNOWN_LABELS
+
+
+def _extract_sanction_amt(block: str):
     val = _next_line_value(block, "Disbd Amt/High Credit:")
     if re.match(r'[\d,]+', val):
         return to_int(val.split()[0])
     m = re.search(r'Disbd\s+Amt[/\s](?:High\s+Credit)?[:\s]*([\d,]+)', block, re.IGNORECASE)
-    return to_int(m.group(1)) if m else 0
+    if m:
+        return to_int(m.group(1))
+    if _value_swallowed(block, "Disbd Amt/High Credit:"):
+        return None
+    return 0
 
 
-def _extract_balance(block: str) -> int:
+def _extract_balance(block: str):
     val = _next_line_value(block, "Current Balance:")
     if re.match(r'-?[\d,]+', val):
         return to_int(val.split()[0])
     m = re.search(r'Current\s+Balance[:\s]*(-?[\d,]+)', block, re.IGNORECASE)
-    return to_int(m.group(1)) if m else 0
+    if m:
+        return to_int(m.group(1))
+    if _value_swallowed(block, "Current Balance:"):
+        return None
+    return 0
 
 
 def _extract_overdue(block: str) -> int:
