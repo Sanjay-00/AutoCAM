@@ -171,6 +171,13 @@ _BLOCK_FIELD  = re.compile(
     re.IGNORECASE,
 )
 
+# Pass 3: page-break recovery where the ENTIRE "Account Information" header
+# text (not just the number, unlike Pass 2) is swallowed by the browser's
+# print footer/header, leaving a bare number line directly followed by
+# "Account Type:" with nothing in between - e.g.:
+#   ...Confidential\n\n32\nAccount Type:\nCOMMERCIAL VEHICLE LOAN\n...
+_BARE_NUM_BLOCK = re.compile(r'\n(\d{1,3})\s*\nAccount\s+Type:\s*\n', re.MULTILINE)
+
 
 def split_account_blocks(text: str) -> list:
     """
@@ -179,6 +186,8 @@ def split_account_blocks(text: str) -> list:
       P4         -  number appears on line BEFORE "Account Information" header
       P5         -  number on same line as Account Type after header
       Pass 2     -  page-break recovery (number swallowed by browser header)
+      Pass 3     -  page-break recovery (entire header text swallowed, only the
+                    bare number survives directly before "Account Type:")
     Returns list of (account_number: int, block_text: str).
     """
     candidates = []
@@ -214,6 +223,17 @@ def split_account_blocks(text: str) -> list:
         prev_nums = [n for p, n in deduped if p < pos]
         prev_num  = max(prev_nums) if prev_nums else 0
         deduped.append((pos, prev_num + 1))
+        found_positions.add(pos)
+
+    # Pass 3  -  bare number directly before "Account Type:", no header text
+    # at all (see _BARE_NUM_BLOCK). The number itself is trustworthy here (it
+    # survived), so use it as-is rather than inferring by ordinal position.
+    for m in _BARE_NUM_BLOCK.finditer(text):
+        pos = m.start(1)
+        if any(abs(pos - fp) < 50 for fp in found_positions):
+            continue
+        num = int(m.group(1))
+        deduped.append((pos, num))
         found_positions.add(pos)
 
     deduped.sort(key=lambda x: x[0])
