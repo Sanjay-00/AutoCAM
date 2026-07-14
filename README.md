@@ -6,9 +6,9 @@
 
 ## The Problem
 
-At Shriram Finance, credit analysts prepare a **CAM (Credit Appraisal Memo)** for every customer with exposure above ₹25 lakh. A critical section requires manually listing every active loan from the customer's CIBIL report  -  sanction amount, outstanding balance, EMI, overdue, DPD, and lender  -  formatted to a specific layout.
+At NBFCs, credit analysts prepare a **CAM (Credit Appraisal Memo)** for every customer with exposure above ₹25 lakh. A critical section requires manually listing every active loan from the customer's CIBIL report  -  sanction amount, outstanding balance, EMI, overdue, DPD, and lender  -  formatted to a specific layout.
 
-For a customer with 3-4 loans this takes 10-15 minutes. For a customer with **50-100+ loan accounts**, it takes 30-60 minutes of careful copy-paste, done 6-7 times per month per branch. One transposition error in a balance figure can affect the credit decision.
+For a customer with 5-15 loans this takes 10-15 minutes. For a customer with **50-100+ loan accounts**, it takes 30-60 minutes of careful copy-paste, done 20-30 times per month per branch. One transposition error in a balance figure can affect the credit decision.
 
 ## The Solution
 
