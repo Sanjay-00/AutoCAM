@@ -11,6 +11,7 @@ Public API (unchanged):
 
 import re
 import json
+import time
 import fitz  # PyMuPDF
 
 from crif_parser import parse_crif, extract_reported_totals, split_account_blocks
@@ -177,10 +178,23 @@ def _content_to_text(content) -> str:
     return str(content)
 
 
+def _is_transient(err: Exception) -> bool:
+    """Rate-limit / overload / timeout errors - worth a short backoff+retry
+    rather than either failing the call outright or burning a model swap."""
+    s = str(err)
+    return any(tok in s for tok in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE",
+                                     "DeadlineExceeded", "Timeout"))
+
+
 def _llm_invoke(api_key: str, prompt) -> str:
     """
     Invoke the Gemini model cascade. `prompt` may be a plain string or a
     multimodal content list (text + image_url parts) for Vision extraction.
+
+    Transient errors (rate-limit/overload) get a short backoff-retry on the
+    SAME model before moving on - these calls run in parallel batches
+    (see _enrich_dpd_vision), so a burst of 429s is expected and recoverable
+    within a couple seconds rather than a real failure.
     """
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -189,16 +203,24 @@ def _llm_invoke(api_key: str, prompt) -> str:
         raise RuntimeError("langchain_google_genai not installed")
 
     for model in _LLM_MODELS:
-        try:
-            llm = ChatGoogleGenerativeAI(
-                model=model, google_api_key=api_key,
-                temperature=0.1, max_tokens=8192,
-            )
-            return _content_to_text(llm.invoke([HumanMessage(content=prompt)]).content)
-        except Exception as e:
-            if "404" in str(e) or "NOT_FOUND" in str(e):
-                continue
-            raise
+        llm = ChatGoogleGenerativeAI(
+            model=model, google_api_key=api_key,
+            temperature=0.1, max_tokens=8192,
+        )
+        last_err = None
+        for delay in (0, 1.5, 3):
+            if delay:
+                time.sleep(delay)
+            try:
+                return _content_to_text(llm.invoke([HumanMessage(content=prompt)]).content)
+            except Exception as e:
+                last_err = e
+                if "404" in str(e) or "NOT_FOUND" in str(e):
+                    break  # model doesn't exist - no point retrying, try next one
+                if not _is_transient(e):
+                    raise
+        if last_err and ("404" in str(last_err) or "NOT_FOUND" in str(last_err)):
+            continue
     raise RuntimeError(f"No Gemini model responded. Tried: {_LLM_MODELS}")
 
 
@@ -209,11 +231,22 @@ def _strip_md(text: str) -> str:
 
 def _normalize(accounts: list) -> list:
     for acc in accounts:
-        for f in ("sr_no", "sanction_amount", "current_balance", "emi", "overdue", "max_dpd"):
+        for f in ("sr_no", "sanction_amount", "current_balance", "emi", "overdue"):
             try:
                 acc[f] = int(float(str(acc.get(f, 0)).replace(",", "")))
             except (ValueError, TypeError):
                 acc[f] = 0
+        # max_dpd: unlike the fields above, None is a meaningful value here -
+        # it means Gemini couldn't read delinquency, not that it's 0/clean.
+        # Preserve it (rendered as "Check CIBIL") instead of defaulting to 0.
+        dpd = acc.get("max_dpd")
+        if dpd is None:
+            acc["max_dpd"] = None
+        else:
+            try:
+                acc["max_dpd"] = int(float(str(dpd).replace(",", "")))
+            except (ValueError, TypeError):
+                acc["max_dpd"] = None
         if not acc.get("date_of_sanction"):
             acc["date_of_sanction"] = "NA"
         if acc.get("status", "").lower() not in ("active", "closed"):
@@ -347,11 +380,20 @@ def _enrich_dpd_vision(accounts: list, doc, page_texts: list, api_key: str,
     summary["pages_sent"]       = sorted(pg + 1 for pg in page_map)
     summary["accounts_checked"] = sorted(acc["sr_no"] for accs in page_map.values() for acc in accs)
 
-    # Render all page images on the main thread first
-    page_uris = {pg_idx: ocr_extractor._img_data_uri(doc[pg_idx])
-                 for pg_idx in page_map}
+    # Render all page images on the main thread first. A single malformed page
+    # (corrupt embedded image, bad content stream) must not abort the whole
+    # extraction - skip it and leave its accounts unresolved (Check CIBIL)
+    # rather than losing every already-validated account to one bad render.
+    page_uris = {}
+    for pg_idx in page_map:
+        try:
+            page_uris[pg_idx] = ocr_extractor._img_data_uri(doc[pg_idx])
+        except Exception:
+            continue
 
-    total = len(page_map)
+    total = len(page_uris)
+    if not total:
+        return summary
     done_count = 0
 
     def _call(pg_idx):
@@ -359,8 +401,11 @@ def _enrich_dpd_vision(accounts: list, doc, page_texts: list, api_key: str,
             page_uris[pg_idx], page_map[pg_idx], api_key, _llm_invoke
         )
 
-    with ThreadPoolExecutor(max_workers=min(total, 6)) as pool:
-        futures = {pool.submit(_call, pg_idx): pg_idx for pg_idx in page_map}
+    # I/O-bound (network latency dominates) - the retry-with-backoff in
+    # _llm_invoke absorbs the 429 bursts this concurrency causes, so raising
+    # it speeds up wall-clock time without trading away accuracy.
+    with ThreadPoolExecutor(max_workers=min(total, 12)) as pool:
+        futures = {pool.submit(_call, pg_idx): pg_idx for pg_idx in page_uris}
         for fut in as_completed(futures):
             done_count += 1
             if on_progress:
@@ -396,9 +441,11 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
     When opted in: if the parse fails the report's summary validation, fall
     back to Gemini Vision on the targeted account pages - but only adopt the
     Vision result if it validates at least as well as the OCR result. Then a
-    second Vision pass (_enrich_dpd_vision) corrects max_dpd on accounts where
-    OCR returned 0, by reading coloured payment-history cells from the image.
-    on_dpd_progress(done, total) fires after each page Vision call completes.
+    second Vision pass (_enrich_dpd_vision) resolves max_dpd on accounts where
+    OCR found no readable payment-history pattern at all (None/"Check CIBIL"),
+    by reading the page image directly. Confident 0-DPD OCR reads are left
+    untouched. on_dpd_progress(done, total) fires after each page Vision call
+    completes.
     """
     name, score, blocks, accounts, reported = parse_crif_commercial(text)
     _renumber(accounts)

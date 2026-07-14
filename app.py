@@ -294,17 +294,20 @@ if data.get("dpd_vision_used"):
     patched = data.get("dpd_vision_patched", [])
     if pages:
         st.info(
-            f"👁️  **Gemini Vision DPD enrichment was used** for this report  -  "
-            f"sent **{len(pages)} page(s)** ({', '.join(map(str, pages))}) covering "
-            f"**{len(checked)} account(s)** (Sr.No {', '.join(map(str, checked))}) that had "
-            f"0 DPD from OCR"
-            + (f", and corrected **{len(patched)}** of them "
-               f"(Sr.No {', '.join(map(str, patched))})."
-               if patched else ", no additional delinquency was found.")
+            f"👁️  **Gemini Vision DPD enrichment was used**  -  sent **{len(pages)} page(s)** "
+            f"covering **{len(checked)} account(s)** where OCR couldn't read the "
+            f"payment-history grid at all, and resolved **{len(patched)}** of them."
         )
+        with st.expander("Show page / account numbers"):
+            st.markdown(f"**Pages sent:** {', '.join(map(str, pages))}")
+            st.markdown(f"**Accounts checked (Sr.No):** {', '.join(map(str, checked))}")
+            st.markdown(
+                f"**Accounts resolved (Sr.No):** {', '.join(map(str, patched))}"
+                if patched else "No additional delinquency was found."
+            )
     else:
         st.info("👁️  Gemini Vision DPD enrichment ran, but every account already had a "
-                "non-zero Max DPD from OCR - nothing to send.")
+                "readable Max DPD from OCR - nothing to send.")
 elif data.get("dpd_vision_recommended"):
     st.warning(
         "⚠️  This is a **scanned report** - OCR can misread DPD in coloured "
