@@ -6,20 +6,20 @@
 
 ## The Problem
 
-At Shriram Finance, credit analysts prepare a **CAM (Credit Appraisal Memo)** for every customer with exposure above ₹25 lakh. A critical section requires manually listing every active loan from the customer's CIBIL report  -  sanction amount, outstanding balance, EMI, overdue, DPD, and lender  -  formatted to a specific layout.
+At NBFCs, credit analysts prepare a **CAM (Credit Appraisal Memo)** for every customer with exposure above ₹25 lakh. A critical section requires manually listing every active loan from the customer's CIBIL report  -  sanction amount, outstanding balance, EMI, overdue, DPD, and lender  -  formatted to a specific layout.
 
-For a customer with 3-4 loans this takes 10-15 minutes. For a customer with **50-100+ loan accounts**, it takes 30-60 minutes of careful copy-paste, done 6-7 times per month per branch. One transposition error in a balance figure can affect the credit decision.
+For a customer with 5-15 loans this takes 10-15 minutes. For a customer with **50-100+ loan accounts**, it takes 30-60 minutes of careful copy-paste, done 6-7 times per month per branch. One transposition error in a balance figure can affect the credit decision.
 
 ## The Solution
 
 AutoCAM eliminates this entirely. Upload a CIBIL PDF → get a formatted, validated Excel file in under a minute.
 
 - Extracts all loan accounts automatically (active and closed)
-- Covers **CRIF High Mark Retail**, **CRIF Commercial ACE**, and **TransUnion CIBIL** formats
+- Covers **CRIF High Mark Retail**, **CRIF Commercial ACE**, and **TransUnion CIBIL** formats  -  PDF or raw HTML export
 - Reads **scanned / image-only** reports via OCR, not just digital PDFs
 - **Self-validates** every extraction against the report's own summary totals before delivering results
-- Falls back to Gemini LLM automatically when rule-based extraction doesn't reconcile  -  no user action needed
-- Outputs an Excel file in the exact format required for the CAM, with DPD colour coding
+- Falls back to Gemini automatically (text correction) on CRIF Retail, and optionally to Gemini **Vision** (full re-extraction + DPD enrichment) on scanned CRIF Commercial reports  -  no user action needed for the free path, one checkbox for the paid one
+- Outputs an Excel file in the exact format required for the CAM, with DPD gradient colour coding and a live SUMIF total
 
 ---
 
@@ -28,10 +28,16 @@ AutoCAM eliminates this entirely. Upload a CIBIL PDF → get a formatted, valida
 | Metric | Before | After |
 |---|---|---|
 | Time per CAM (CIBIL section) | 30-60 min manual entry | < 1 minute |
-| Transcription risk | High  -  manual copy-paste from PDF | Eliminated  -  validated against report totals |
-| Reports with 50+ accounts | Impractical to do accurately | Handled reliably |
-| Scanned / emailed PDFs | Not processable | OCR'd and extracted automatically |
-| Analyst trust in output | No way to verify without re-reading PDF | Validation badge shows pass/fail against bureau's own numbers |
+| Transcription risk | High  -  manual copy-paste from PDF | Eliminated  -  validated against the report's own printed totals, not eyeballed |
+| Reports with 50+ accounts | Impractical to do accurately by hand | Handled reliably, same runtime as a small report |
+| Scanned / emailed PDFs | Not processable at all | OCR'd and extracted automatically, no manual retyping |
+| 180-page scanned Commercial ACE report | ~400s serial OCR | ~123s with the parallel pipeline (~3.25×) |
+| Fields OCR genuinely can't read (dense DPD grids) | Silently shown as 0 (wrong, undetectable) | Flagged as "Check CIBIL" so the analyst knows exactly which cell to verify |
+| Analyst trust in output | No way to verify without re-reading the whole PDF | Validation badge shows pass/fail against the bureau's own arithmetic |
+| Volume this replaces | 6-7 CAMs/month/branch, each 30-60 min of manual entry | Same volume, each under a minute, freeing ~3-6 analyst-hours/month/branch |
+
+*(Speedup/accuracy figures above are the project's own measured/reported numbers from
+development, not independently re-benchmarked for this README.)*
 
 ---
 
@@ -66,26 +72,34 @@ AutoCAM eliminates this entirely. Upload a CIBIL PDF → get a formatted, valida
 ### Architecture
 
 ```
-PDF upload
+PDF or HTML upload
     │
-    ├─ Digital PDF? → PyMuPDF text extraction (instant)
-    └─ Scanned PDF? → Tesseract OCR (parallel, page-by-page)
+    ├─ HTML? ─────────────► parse tags to plain text (same shape as a digital PDF)
+    │
+    └─ PDF: Digital? ─────► PyMuPDF text extraction (instant)
+       Scanned? ──────────► Tesseract OCR, parallel pipeline, geometry-reconstructed
+                             + left-margin colour-strip status detection
                             │
                             ▼
                    Provider detection
-                   (CRIF Retail / CRIF Commercial / TransUnion)
+                   (CRIF Retail / CRIF Commercial ACE / TransUnion)
                             │
                             ▼
                    Rule-based text parsing
-                   (regex + positional extraction)
+                   (regex + positional/hybrid extraction, per bureau format)
                             │
                             ▼
-              Self-validation against report's own summary
-               ├─ PASS → deliver result
-               └─ FAIL + API key → Gemini LLM correction (stage 2 or 3)
+       Self-validation against the report's own printed summary totals
+               │
+       ┌───────┴────────────────────────────────────────────┐
+       ▼ PASS                                                ▼ FAIL
+   deliver result              CRIF Retail  → Gemini text correction (stage 2/3)
+                                CRIF Comml.  → Gemini Vision re-extraction (opt-in)
+                                              → Gemini Vision DPD enrichment (opt-in)
+                                TransUnion   → no fallback, returned as-is
                             │
                             ▼
-                   Formatted Excel output
+                   Formatted Excel output (DPD gradient, live SUMIF total)
 ```
 
 ### Key Engineering Decisions
@@ -97,10 +111,13 @@ CRIF reports use a multi-column grid layout. Tesseract's default reading order s
 Every CRIF report contains its own Account Summary table with pre-calculated totals. The app extracts these numbers and compares them against the sum of extracted account balances. A green badge means the extraction is confirmed against the bureau's own arithmetic  -  the analyst doesn't need to verify anything manually. This is what makes the output trustworthy in a regulated lending context.
 
 **Parallel OCR pipeline**
-A 180-page Commercial ACE report took ~400 seconds serially. The app now pipelines rendering (main thread, MuPDF single-threaded) with OCR (worker pool, Tesseract subprocess releases the GIL). Result: **~123 seconds on the same report  -  3.25× faster**  -  with byte-identical output by construction.
+A 180-page Commercial ACE report took ~400 seconds serially. The app now pipelines rendering (main thread, MuPDF single-threaded) with OCR (worker pool, Tesseract subprocess releases the GIL). Result: **~123 seconds on the same report  -  3.25× faster**  -  with byte-identical output by construction, since results are reassembled strictly in page order regardless of which worker finishes first.
 
-**LLM as fallback, not primary**
-Rule-based parsing is free, instant, and deterministic. LLM correction (Gemini) is only triggered when validation fails. Stage 2 sends only the problematic account blocks; Stage 3 sends the full document. Cascades through 4 Gemini model versions for resilience against quota limits.
+**LLM as fallback, not primary  -  and Vision as an explicit opt-in, not automatic**
+Rule-based parsing is free, instant, and deterministic; Gemini is only invoked when the report's own summary numbers say the rule-based result is wrong. On CRIF Retail, text-based correction runs in two escalating stages (block-level fix, then full re-extraction) and cascades through 4 Gemini model versions for resilience against quota limits. On CRIF Commercial scans, Gemini **Vision** re-extraction and DPD enrichment are gated behind a UI checkbox (cost/latency are shown to the user up front), and a Vision result is only adopted if it validates at least as well as the rule-based one  -  it can never make an already-good extraction worse.
+
+**"Check CIBIL" instead of a silent wrong zero**
+A field OCR genuinely couldn't read (e.g. a DPD grid cell under coloured shading) is tracked as `None`, distinct from a confidently-read `0`. The UI and Excel output both render `None` as an explicit "Check CIBIL" flag rather than a zero that looks trustworthy but isn't  -  this is also what lets Vision DPD enrichment target only the accounts that actually need re-checking.
 
 **Colored margin strip detection**
 CRIF Commercial ACE marks each account's status with a vertical colored strip in the left margin (red = active, green = closed). The app detects this via NumPy pixel analysis on the rendered page image and injects a status token into the OCR text stream  -  more reliable than the (often blank) Closure Reason / Closed Date fields.
@@ -111,12 +128,22 @@ CRIF Commercial ACE marks each account's status with a vertical colored strip in
 |---|---|
 | Web app | Streamlit |
 | PDF text extraction | PyMuPDF (fitz) |
-| OCR engine | Tesseract via pytesseract |
-| Parallel OCR | Python `ThreadPoolExecutor` (pipelined) |
-| Image processing | Pillow, NumPy |
-| LLM fallback | Google Gemini (text + vision) via `google-generativeai` |
-| Excel generation | openpyxl |
-| Deployment | Streamlit Cloud |
+| HTML report support | Stdlib `re`/`html` (tag stripping → PDF-shaped text) |
+| OCR engine | Tesseract via pytesseract, word-box (`image_to_data`) geometry reconstruction |
+| Parallel OCR | Python `ThreadPoolExecutor` (rendering/OCR pipelined across a bounded queue) |
+| Image processing | Pillow, NumPy (colour-strip detection) |
+| LLM fallback | Google Gemini 2.5/2.0 (text + Vision) via `langchain-google-genai` |
+| Excel generation | openpyxl (conditional formatting, live formulas) |
+| Deployment | Streamlit Community Cloud |
+
+### Technical Skills Demonstrated
+
+- **Computer vision without a CV library**  -  colour-strip status detection is plain NumPy array slicing/thresholding on rendered page pixels, not OpenCV; word-box geometry reconstruction turns OCR output back into structured layout using nothing but y-coordinate clustering.
+- **Concurrency with a real constraint to respect**  -  a bounded producer/consumer pipeline (`ThreadPoolExecutor` + an in-flight cap) built around a genuine thread-safety limitation (MuPDF isn't thread-safe; Tesseract-as-subprocess is), not concurrency for its own sake.
+- **Defensive, self-checking data extraction**  -  every extraction is validated against numbers the source document itself printed, with an explicit `None`-vs-`0` convention so "couldn't read this" is never confused with "read this as zero."
+- **Multi-format regex parsing at scale**  -  three distinct bureau report layouts (next-line label/value, inline 3-column grid, amounts-before-header), each with multiple real-world sub-variants (HTML-to-PDF page breaks, OCR noise, format-version drift), reconciled through hybrid/positional extraction strategies rather than one-off patches.
+- **Applied LLM engineering**  -  a cost-aware, opt-in escalation cascade (rule-based → text LLM → Vision LLM) with prompts that encode domain-specific ground truth (the bureau's own colour convention) as a model self-check, and a "keep whichever candidate validates better" adoption rule instead of blind LLM trust.
+- **Production spreadsheet generation**  -  openpyxl with conditional gradient formatting, live formulas (`SUMIF`), and print/freeze-pane setup matching an exact organizational template.
 
 ---
 
@@ -139,5 +166,7 @@ Set `GEMINI_API_KEY=...` in a `.env` file locally, or in Streamlit Secrets when 
 ## Limitations
 
 - OCR of a large scanned report (100+ pages) takes 2-3 minutes on a 2-core machine
-- Max DPD on scanned reports is best-effort  -  Tesseract accuracy on dense payment history grids is ~80-85%
-- TransUnion reports have no LLM fallback (digital parsing only)
+- Max DPD on scanned reports is best-effort  -  Tesseract accuracy on dense payment history grids is ~80-85%; unreadable cells are flagged "Check CIBIL" rather than guessed
+- TransUnion reports have no LLM or Vision fallback at all (digital, rule-based parsing only)
+- Gemini Vision fallback is opt-in and per-report, not automatic  -  a scanned report that fails validation will say so and recommend Vision, but won't call it without the user ticking the checkbox
+- No automated test suite exists yet; extraction confidence relies on the runtime validation-against-summary-totals check, not pre-merge regression tests
