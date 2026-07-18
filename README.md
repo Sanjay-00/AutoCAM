@@ -14,10 +14,11 @@ For a customer with 5-15 loans this takes 10-15 minutes. For a customer with **5
 
 AutoCAM eliminates this entirely. Upload a CIBIL PDF → get a formatted, validated Excel file in under a minute.
 
-- Extracts all loan accounts automatically (active and closed)
+- Extracts all loan accounts automatically (active, closed, written-off, and settled, with delinquent/suit-filed flagged separately)
 - Covers **CRIF High Mark Retail**, **CRIF Commercial ACE**, and **TransUnion CIBIL** formats  -  PDF or raw HTML export
 - Reads **scanned / image-only** reports via OCR, not just digital PDFs
 - **Self-validates** every extraction against the report's own summary totals before delivering results
+- On CRIF Commercial ACE reports, adds a **Credit Analysis** view alongside the account table  -  exposure vs. the rest of the market, asset-class distribution, and a derogatory-status rollup, both in the app and in the downloaded Excel
 - Falls back to Gemini automatically (text correction) on CRIF Retail, and optionally to Gemini **Vision** (full re-extraction + DPD enrichment) on scanned CRIF Commercial reports  -  no user action needed for the free path, one checkbox for the paid one
 - Outputs an Excel file in the exact format required for the CAM, with DPD gradient colour coding and a live SUMIF total
 
@@ -169,4 +170,5 @@ Set `GEMINI_API_KEY=...` in a `.env` file locally, or in Streamlit Secrets when 
 - Max DPD on scanned reports is best-effort  -  Tesseract accuracy on dense payment history grids is ~80-85%; unreadable cells are flagged "Check CIBIL" rather than guessed
 - TransUnion reports have no LLM or Vision fallback at all (digital, rule-based parsing only)
 - Gemini Vision fallback is opt-in and per-report, not automatic  -  a scanned report that fails validation will say so and recommend Vision, but won't call it without the user ticking the checkbox
-- No automated test suite exists yet; extraction confidence relies on the runtime validation-against-summary-totals check, not pre-merge regression tests
+- CRIF Commercial digital reports have no LLM/Vision fallback at all yet (Vision is scanned-only); a digital Commercial report that fails validation ships flagged invalid with no automatic recovery
+- A regression suite (`tests/`) checks internal-consistency invariants (not golden-value matches) against a local, gitignored folder of sample reports  -  see `CIBIL_TEST_DIR` in the repo's `CLAUDE.md`. Runtime validation-against-summary-totals remains the primary trust signal for any single extraction.
