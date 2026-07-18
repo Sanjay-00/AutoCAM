@@ -516,7 +516,6 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
         "provider":               "crif_commercial",
         "analysis":               analysis,
         "tesseract_version":      ocr_extractor.tesseract_version() if scanned else None,
-        "raw_ocr_text":           text if scanned else None,
         "vision_fallback_recommended": vision_fallback_recommended,
         "vision_fallback_used":        vision_fallback_used,
         "dpd_vision_recommended": dpd_vision_recommended,
@@ -577,7 +576,6 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
             "validation":        validation,
             "provider":          "transunion",
             "tesseract_version": ocr_extractor.tesseract_version() if scanned else None,
-            "raw_ocr_text":      text if scanned else None,
         }
 
     # ── CRIF Commercial ACE path ──────────────────────────────
@@ -620,7 +618,6 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
         "validation":        validation,
         "provider":          "crif",
         "tesseract_version": ocr_extractor.tesseract_version() if scanned else None,
-        "raw_ocr_text":      text if scanned else None,
     }
 
 
