@@ -230,11 +230,24 @@ _status_text   = st.empty()
 
 def _on_ocr_progress(current: int, total: int):
     pct = int(current / total * 100)
-    _progress_bar.progress(pct, text=f"Scanning page {current} of {total}…")
-    _status_text.caption(
-        f"OCR in progress · {current}/{total} pages done"
-        + ("  -  this takes a few minutes for large scanned reports" if current == 1 else "")
-    )
+    if current == total:
+        # After the last page, parser.parse() still has validation and (if
+        # that fails and an API key is set) a blocking Gemini correction call
+        # ahead of it - neither has a progress callback of its own, so
+        # without this the UI would sit on "page N of N" for several more
+        # seconds with nothing updating, reading as a frozen page rather
+        # than as still working.
+        _progress_bar.progress(100, text="OCR complete - validating extraction…")
+        _status_text.caption(
+            "Checking extracted totals against the report's own summary - if a "
+            "correction pass is needed this can take a few more seconds."
+        )
+    else:
+        _progress_bar.progress(pct, text=f"Scanning page {current} of {total}…")
+        _status_text.caption(
+            f"OCR in progress · {current}/{total} pages done"
+            + ("  -  this takes a few minutes for large scanned reports" if current == 1 else "")
+        )
 
 
 def _on_dpd_progress(done: int, total: int):
