@@ -45,6 +45,21 @@ def _configure_tesseract():
     return pytesseract  # assume it's on PATH (Linux / Streamlit Cloud)
 
 
+def tesseract_version() -> str:
+    """
+    The exact Tesseract build actually running, e.g. '5.4.0.20240606'. Local
+    installs and Streamlit Cloud's unpinned `tesseract-ocr` apt package can
+    resolve to different versions even from identical code - surfacing this
+    lets a "works locally, not on Cloud" report be diagnosed directly instead
+    of guessed at.
+    """
+    try:
+        pytesseract = _configure_tesseract()
+        return str(pytesseract.get_tesseract_version())
+    except Exception:
+        return "unavailable"
+
+
 # Render scale for OCR (higher = sharper text, slower). 3x ≈ 216 DPI on A4.
 _OCR_MATRIX    = fitz.Matrix(3, 3)
 # Vision images can be smaller; 2x keeps tokens down while staying legible.
@@ -195,18 +210,27 @@ def _inject_status(rows: list, strips: list) -> None:
         rows[idx] = (rows[idx][0], rows[idx][1] + " " + token)
 
 
+# Force the LSTM engine explicitly (--oem 1) rather than relying on each
+# Tesseract build's own default (--oem 3, "whatever's available"). Different
+# distro packages (e.g. Streamlit Cloud's unpinned apt tesseract-ocr vs a
+# local Windows install) can ship with different legacy-engine data bundled,
+# so leaving OEM implicit is one more axis two environments can silently
+# disagree on top of - being explicit closes at least that one.
+_TESS_CONFIG = "--oem 1"
+
+
 def _ocr_image(pytesseract, img) -> str:
     """Geometry-aware OCR of one rendered page image, with a plain-text fallback."""
     from pytesseract import Output
     try:
-        data = pytesseract.image_to_data(img, output_type=Output.DICT)
+        data = pytesseract.image_to_data(img, output_type=Output.DICT, config=_TESS_CONFIG)
         rows = _reconstruct_rows(data)
         if rows:
             _inject_status(rows, _detect_status_strips(img))
             return "\n".join(t for _y, t in rows)
     except Exception:
         pass
-    return pytesseract.image_to_string(img)
+    return pytesseract.image_to_string(img, config=_TESS_CONFIG)
 
 
 def _ocr_page(pytesseract, page) -> str:

@@ -308,6 +308,13 @@ st.divider()
 s1, s2 = st.columns(2)
 with s1:
     _method_badge(data["extraction_method"])
+    tv = data.get("tesseract_version")
+    if tv:
+        # Local installs and Streamlit Cloud's unpinned tesseract-ocr apt package
+        # can resolve to different builds from identical code - if the same PDF
+        # extracts differently here than on another machine, compare this value
+        # first before assuming it's a code bug.
+        st.caption(f"OCR engine: Tesseract {tv}")
 with s2:
     _validation_badge(data["validation"])
 
