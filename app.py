@@ -328,19 +328,6 @@ with s1:
         # extracts differently here than on another machine, compare this value
         # first before assuming it's a code bug.
         st.caption(f"OCR engine: Tesseract {tv}")
-    raw_text = data.get("raw_ocr_text")
-    if raw_text:
-        # Different Tesseract builds (e.g. local vs Streamlit Cloud's unpinned
-        # apt package) can OCR the same page into slightly different text,
-        # enough to shift the account count. Download this from both
-        # environments and diff them to find exactly where they diverge -
-        # far more precise than guessing from the extracted numbers alone.
-        st.download_button(
-            "⬇️ Download raw OCR text (debug)",
-            data=raw_text,
-            file_name="raw_ocr_text.txt",
-            mime="text/plain",
-        )
 with s2:
     _validation_badge(data["validation"])
 
