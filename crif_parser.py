@@ -171,6 +171,19 @@ _BLOCK_FIELD  = re.compile(
     re.IGNORECASE,
 )
 
+# OCR can drop the word "Account" from the header entirely (not just corrupt
+# it - see _AI_HEADER above), leaving a bare "Information" line. Confirmed on
+# a real report where a newer Tesseract build (5.5.0) read this same block
+# more poorly than an older one (5.4.0) did, dropping "Account" outright and
+# mangling "Account Type:" down to "ype: #:" on the next line - exactly the
+# kind of OCR-quality difference that shifts the block count between
+# environments running identical code. "Information" alone also appears
+# elsewhere in the document (e.g. "Inquiry Input Information"), so this is
+# only safe to treat as a header start when the very next line still carries
+# a garbled fragment of "Type:" - that combination doesn't occur outside a
+# real account block's header.
+_BARE_INFO_HEADER = re.compile(r'\bInformation\s*\n(?=[^\n]*ype\s*:)', re.MULTILINE | re.IGNORECASE)
+
 # Pass 3: page-break recovery where the ENTIRE "Account Information" header
 # text (not just the number, unlike Pass 2) is swallowed by the browser's
 # print footer/header, leaving a bare number line directly followed by
@@ -214,12 +227,29 @@ def split_account_blocks(text: str) -> list:
         # No P1-P5 match (e.g. PROV2 OCR where number/Account Type line is garbled).
         # Fall through to Pass 2 which discovers blocks by field presence alone.
         deduped, found_positions = [], set()
-    for m in _AI_HEADER.finditer(text):
-        pos = m.start()
-        if any(abs(pos - fp) < 50 for fp in found_positions):
-            continue
-        if not _BLOCK_FIELD.search(text[pos: pos + 1000]):
-            continue
+    # Pass 2 (header corrupted but still recognisable) and Pass 2b (header
+    # lost the word "Account" entirely - see _BARE_INFO_HEADER) both infer
+    # their ordinal from "how many blocks come before this position", so
+    # their candidate positions must be collected FIRST and numbered
+    # together in one position-sorted pass. Numbering each regex's matches
+    # incrementally in two separate passes can give two genuinely different
+    # accounts the same inferred number whenever a Pass 2b position lands
+    # between two Pass 2 positions (each pass numbers against a different
+    # partial snapshot of `deduped`) - and the same-number merge step below
+    # would then wrongly treat them as one account reprinted across a page
+    # break, silently dropping a real account.
+    pass2_positions = []
+    for pat in (_AI_HEADER, _BARE_INFO_HEADER):
+        for m in pat.finditer(text):
+            pos = m.start()
+            if any(abs(pos - fp) < 50 for fp in found_positions):
+                continue
+            if not _BLOCK_FIELD.search(text[pos: pos + 1000]):
+                continue
+            if not any(abs(pos - p) < 50 for p in pass2_positions):
+                pass2_positions.append(pos)
+
+    for pos in sorted(pass2_positions):
         prev_nums = [n for p, n in deduped if p < pos]
         prev_num  = max(prev_nums) if prev_nums else 0
         deduped.append((pos, prev_num + 1))
