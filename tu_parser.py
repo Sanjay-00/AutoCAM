@@ -257,18 +257,31 @@ def validate(accounts: list, reported: dict) -> dict:
     expected_count   = reported.get("account_count")
     expected_balance = reported.get("total_balance")
 
-    if expected_count is not None and total_count != expected_count:
+    # Zero accounts extracted is only a genuine pass when the Credit Summary
+    # totals confirm it. If we extracted nothing AND couldn't find those
+    # totals either, that's not verified - it's what a silent block-split
+    # failure (e.g. an unrecognised report layout) looks like too. Flag it
+    # instead of reporting a clean "valid" with no ground truth behind it.
+    if not accounts and expected_count is None and expected_balance is None:
         issues.append(
-            f"Account count mismatch: extracted {total_count}, "
-            f"report says {expected_count}"
+            "No accounts extracted and the report's own Credit Summary "
+            "totals could not be found either - this could be a genuinely "
+            "empty report, or a parsing failure. Please check the source "
+            "manually."
         )
-    if expected_balance and expected_balance > 0:
-        tolerance = max(expected_balance * 0.05, 1000)
-        if abs(active_balance - expected_balance) > tolerance:
+    else:
+        if expected_count is not None and total_count != expected_count:
             issues.append(
-                f"Balance mismatch: extracted Rs.{active_balance:,}, "
-                f"report says Rs.{expected_balance:,}"
+                f"Account count mismatch: extracted {total_count}, "
+                f"report says {expected_count}"
             )
+        if expected_balance and expected_balance > 0:
+            tolerance = max(expected_balance * 0.05, 1000)
+            if abs(active_balance - expected_balance) > tolerance:
+                issues.append(
+                    f"Balance mismatch: extracted Rs.{active_balance:,}, "
+                    f"report says Rs.{expected_balance:,}"
+                )
 
     return {
         "valid":             len(issues) == 0,
