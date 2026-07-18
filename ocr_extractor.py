@@ -328,11 +328,17 @@ _VISION_PROMPT = (
     "(these are DIFFERENT fields  -  read each separately); overdue = 'Amount Overdue'.\n"
     "- entity = the 'Lender' value (use \"Not Disclosed\" if masked as XXXX).\n"
     "- type_of_loan = the 'Type' value.\n"
-    "- max_dpd = worst days-past-due in the Payment History grid; 0 if every "
-    "entry is Standard/STD. Colour is a cross-check: cells are only coloured "
-    "(orange shifting to red as the number grows) when DPD > 30 - an uncoloured "
-    "cell can still be a small non-zero DPD (1-30), but a coloured cell must read "
-    "as a number > 30, so re-check if your first read of a coloured cell is <= 30.\n"
+    "- max_dpd = worst days-past-due in the Payment History grid. The grid cells come in TWO "
+    "different formats - check which this report uses before answering:\n"
+    "    FORMAT A: a real number is printed, 'NNN/xxx' (e.g. '033/xxx' = 33 DPD). Colour is a "
+    "cross-check here: cells are only coloured (orange shifting to red as the number grows) when "
+    "DPD > 30 - an uncoloured cell can still be a small non-zero DPD (1-30), but a coloured cell "
+    "must read as a number > 30, so re-check if your first read of a coloured cell is <= 30.\n"
+    "    FORMAT B: no number is printed at all, only a placeholder plus a named code - 'xxx/STD', "
+    "'xxx/SM0', 'xxx/SM1', 'xxx/SM2', 'xxx/SUB', 'xxx/DBT', 'xxx/LOS' (placeholder may come before "
+    "or after the code). There is NO digit to read here - do NOT invent one. Map the worst code "
+    "seen to: STD=0, SM0/SMA-0=15, SM1/SMA-1=45, SM2/SMA-2=75, SUB=120, DBT or LOS=200.\n"
+    "  0 if every entry is Standard/STD.\n"
     "- status = 'Closed' if Closure Reason is WRITTEN OFF / SETTLED / CLOSED or a "
     "Closed Date is present, else 'Active'.\n"
     "Amounts as plain integers in rupees (no commas/symbols). Use 0 when blank or "
@@ -351,24 +357,37 @@ import re as _re
 
 _DPD_PAGE_PROMPT = """\
 This page is from a CRIF High Mark COMMERCIAL ACE credit report.
-The Payment History/Asset Classification table shows cells like "NNN/xxx" where NNN = days \
-past due (e.g. "033/xxx" → 33 DPD, "000/xxx" → 0 DPD, "546/xxx" → 546 DPD).
+The Payment History/Asset Classification table cells come in TWO different formats depending \
+on the report - check which one this page actually uses before answering:
 
-Colour is a strong cross-check: cells are only coloured when DPD is GREATER THAN 30, and the \
-colour shifts from orange (just over 30) to deep red (very high DPD) as the number increases. \
-Uncoloured cells can still have a small non-zero DPD (1-30) - don't assume uncoloured means zero. \
-But a coloured cell must read as a number > 30: if your first read of a coloured cell comes out \
-<= 30, look again, since that combination is inconsistent with the report's own colour convention.
+FORMAT A - a real days-past-due number is printed: "NNN/xxx" where NNN = days past due \
+(e.g. "033/xxx" → 33 DPD, "000/xxx" → 0 DPD, "546/xxx" → 546 DPD).
 
-For EACH account listed below (identified by Sanctioned Date and Sanctioned Amount), \
-find its Payment History grid and return the MAXIMUM NNN value across all months.
+FORMAT B - no day-count is printed at all, only a placeholder plus a named asset-classification \
+code: "xxx/STD", "xxx/SM0", "xxx/SM1", "xxx/SM2", "xxx/SUB", "xxx/DBT", "xxx/LOS" (the placeholder \
+may appear before OR after the code). There is NO digit to read here - do not invent one. Map the \
+WORST code seen across the account's months to a representative DPD instead:
+  STD → 0   |   SM0 (or SMA-0) → 15   |   SM1 (or SMA-1) → 45   |   SM2 (or SMA-2) → 75
+  SUB (Substandard) → 120   |   DBT (Doubtful) or LOS (Loss) → 200
+
+Colour is a strong cross-check under FORMAT A: cells are only coloured when DPD is GREATER THAN \
+30, and the colour shifts from orange (just over 30) to deep red (very high DPD) as the number \
+increases. Uncoloured cells can still have a small non-zero DPD (1-30) - don't assume uncoloured \
+means zero. But a coloured cell must read as a number > 30 under Format A: if your first read of a \
+coloured Format-A cell comes out <= 30, look again. Under FORMAT B, colour instead simply marks a \
+non-STD code (SM0/SM1/SM2/SUB/DBT/LOS) - it does not imply any specific number itself, use the code \
+lookup above.
+
+For EACH account listed below (identified by Sanctioned Date and Sanctioned Amount), find its \
+Payment History grid, determine which format it uses, and return the MAXIMUM resulting DPD value \
+across all months (Format A: highest NNN read; Format B: representative value of the worst code seen).
 
 Accounts on this page:
 {account_list}
 
 Return ONLY a JSON object mapping each "DATE|AMOUNT" key to its max DPD integer:
 {{"DD-MM-YYYY|AMOUNT": 33, "DD-MM-YYYY|AMOUNT": 546}}
-Use 0 if the account's history is all 000 or not found. No other text.\
+Use 0 if the account's history is all STD/000 or not found. No other text.\
 """
 
 

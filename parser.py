@@ -16,7 +16,7 @@ import fitz  # PyMuPDF
 
 from crif_parser import parse_crif, extract_reported_totals, split_account_blocks
 from crif_parser import _is_closed, _extract_balance, _extract_entity
-from crif_commercial_parser import parse_crif_commercial
+from crif_commercial_parser import parse_crif_commercial, credit_profile_summary, derog_summary
 from tu_parser   import parse_transunion
 import ocr_extractor
 import html_extractor
@@ -125,17 +125,31 @@ def validate_extraction(accounts: list, reported: dict) -> dict:
     exp_count = reported.get("account_count")
     exp_bal   = reported.get("total_balance")
 
-    if exp_count is not None and count != exp_count:
+    # Zero accounts extracted is only a genuine pass when the report's own
+    # summary totals confirm it (e.g. a real thin-file/no-trade-history
+    # report, where account_count comes back 0 rather than None). If we
+    # extracted nothing AND couldn't find the summary totals either, that's
+    # not verified - it just means we have no ground truth to check against,
+    # which is exactly what a silent block-splitting failure looks like too.
+    # Flag it instead of reporting a clean "valid" with nothing behind it.
+    if not accounts and exp_count is None and exp_bal is None:
         issues.append(
-            f"Active account count mismatch: extracted {count}, "
-            f"report says {exp_count}"
+            "No accounts extracted and the report's own summary totals "
+            "could not be found either - this could be a genuinely empty "
+            "report, or a parsing failure. Please check the source manually."
         )
-    if exp_bal and exp_bal > 0:
-        if abs(balance - exp_bal) > max(exp_bal * 0.05, 1000):
+    else:
+        if exp_count is not None and count != exp_count:
             issues.append(
-                f"Balance mismatch: extracted Rs.{balance:,}, "
-                f"report says Rs.{exp_bal:,}"
+                f"Active account count mismatch: extracted {count}, "
+                f"report says {exp_count}"
             )
+        if exp_bal and exp_bal > 0:
+            if abs(balance - exp_bal) > max(exp_bal * 0.05, 1000):
+                issues.append(
+                    f"Balance mismatch: extracted Rs.{balance:,}, "
+                    f"report says Rs.{exp_bal:,}"
+                )
 
     return {
         "valid":             len(issues) == 0,
@@ -447,7 +461,7 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
     untouched. on_dpd_progress(done, total) fires after each page Vision call
     completes.
     """
-    name, score, blocks, accounts, reported = parse_crif_commercial(text)
+    name, score, blocks, accounts, reported, analysis = parse_crif_commercial(text, scanned)
     _renumber(accounts)
 
     method     = METHOD_OCR if scanned else METHOD_RULE_BASED
@@ -485,6 +499,14 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
         dpd_vision_summary = _enrich_dpd_vision(accounts, doc, page_texts, api_key,
                                                 on_progress=on_dpd_progress)
 
+    # Vision fallback / DPD enrichment above can replace or patch `accounts`
+    # after parse_crif_commercial() built `analysis` - the two account-derived
+    # sections need recomputing against the FINAL list so they match what's
+    # actually shown in the accounts table. borrower_summary is parsed from
+    # the report text directly, unaffected by any of that, so it's left as-is.
+    analysis["credit_profile_summary"] = credit_profile_summary(accounts)
+    analysis["derog_summary"]          = derog_summary(accounts)
+
     return {
         "name":                   name,
         "score":                  score,
@@ -492,6 +514,7 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
         "extraction_method":      method,
         "validation":             validation,
         "provider":               "crif_commercial",
+        "analysis":               analysis,
         "vision_fallback_recommended": vision_fallback_recommended,
         "vision_fallback_used":        vision_fallback_used,
         "dpd_vision_recommended": dpd_vision_recommended,

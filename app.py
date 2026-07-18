@@ -4,6 +4,8 @@ CRIF High Mark PDF → Structured Excel
 """
 
 import os
+import re
+from collections import Counter
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -64,6 +66,26 @@ def _fmt_inr(n) -> str:
 
 
 def _score_badge(score):
+    # CRIF Commercial isn't a 300-900 score - it's a 1 (best) - 5 (worst) risk
+    # rank rendered as "N (Label)", e.g. "5 (Very High Risk)". Colour it on
+    # its own scale (low rank = good = green) rather than falling through to
+    # the plain-text branch below, which used to show it unstyled.
+    m = re.match(r'^\s*(\d)\s*\(', str(score))
+    if m:
+        rank = int(m.group(1))
+        if rank <= 2:
+            color = "#1e7e34"
+        elif rank == 3:
+            color = "#856404"
+        else:
+            color = "#721c24"
+        st.markdown(
+            f'<div style="display:inline-block;background:{color};color:white;'
+            f'padding:0.3rem 1rem;border-radius:8px;font-size:1.5rem;font-weight:700;">'
+            f'{score}</div>',
+            unsafe_allow_html=True,
+        )
+        return
     try:
         s = int(score)
         if s >= 750:
@@ -131,6 +153,20 @@ def _amt(v):
     """Return value as-is if numeric, or 'Check CIBIL' sentinel if None."""
     return _CHECK_CIBIL if v is None else v
 
+def _status_display(a: dict) -> str:
+    # CRIF Commercial only: Delinquent/Suit Filed are independent overlay
+    # flags on top of the canonical status (Active/Closed/Written Off/
+    # Settled) - same composition excel_generator uses, kept identical so
+    # the on-screen table matches the downloaded Excel exactly.
+    flags = []
+    if a.get("delinquent"):
+        flags.append("Delinquent")
+    if a.get("suit_filed"):
+        flags.append("Suit Filed")
+    status = a["status"]
+    return f"{status} ({', '.join(flags)})" if flags else status
+
+
 def _to_df(accounts: list) -> pd.DataFrame:
     return pd.DataFrame([{
         "Sr.No":            a["sr_no"],
@@ -143,7 +179,7 @@ def _to_df(accounts: list) -> pd.DataFrame:
         "Ownership":        a.get("ownership", ""),
         "Type of Loan":     a["type_of_loan"],
         "Max DPD":          _amt(a["max_dpd"]),
-        "Status":           a["status"],
+        "Status":           _status_display(a),
     } for a in accounts])
 
 
@@ -164,11 +200,11 @@ _COL_CFG = {
 
 # ── Page header ───────────────────────────────────────────────────
 st.markdown("## 🏦 AutoCAM &nbsp;·&nbsp; CIBIL Report Analyser")
-st.caption("Upload a CRIF High Mark CIBIL PDF or HTML report · Extracts structured loan data · Outputs Excel")
+st.caption("Upload a CRIF High Mark or TransUnion CIBIL PDF or HTML report · Extracts structured loan data · Outputs Excel")
 st.divider()
 
 # ── Upload & trigger ──────────────────────────────────────────────
-uploaded = st.file_uploader("Upload CRIF CIBIL PDF or HTML", type=["pdf", "html", "htm"], label_visibility="visible")
+uploaded = st.file_uploader("Upload CRIF or TransUnion CIBIL PDF or HTML", type=["pdf", "html", "htm"], label_visibility="visible")
 
 col_btn, col_dpd, _ = st.columns([1, 2, 2])
 with col_btn:
@@ -225,7 +261,10 @@ _status_text.empty()
 
 accounts = data["accounts"]
 active   = [a for a in accounts if a["status"] == "Active"]
-closed   = [a for a in accounts if a["status"] == "Closed"]
+# "Closed" here means "not Active" - CRIF Commercial has Written Off/Settled
+# too, and every account must land in Active or here so the tab counts
+# always add up to the total (no account silently disappears from both).
+closed   = [a for a in accounts if a["status"] != "Active"]
 name     = data["name"]
 score    = data["score"]
 
@@ -335,6 +374,9 @@ with tab_active:
         st.info("No active accounts.")
 with tab_closed:
     if closed:
+        breakdown = Counter(a["status"] for a in closed)
+        if len(breakdown) > 1:
+            st.caption("  ·  ".join(f"**{v}** {k}" for k, v in breakdown.items()))
         st.dataframe(_to_df(closed), column_config=_COL_CFG, use_container_width=True, hide_index=True)
     else:
         st.info("No closed accounts.")
@@ -345,6 +387,73 @@ if data["extraction_method"] == METHOD_OCR:
         "grid has tiny digits that OCR can misread. Verify against the PDF for any "
         "delinquent (non-zero DPD) account before relying on it."
     )
+
+# ── Credit Analysis  (CRIF Commercial only)  ───────────────────────
+analysis = data.get("analysis")
+if analysis:
+    st.divider()
+    st.markdown("#### 📑 Credit Analysis")
+
+    bs = analysis.get("borrower_summary") or {}
+    your_inst  = bs.get("your_institution")  or {}
+    other_inst = bs.get("other_institution") or {}
+
+    st.caption("Our exposure vs the market")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Our Live Accounts",      your_inst.get("live_accts", "NA"))
+    b2.metric("Our Outstanding",        _fmt_inr(your_inst.get("outstanding_amt")) if your_inst.get("outstanding_amt") is not None else "NA")
+    b3.metric("Market Live Accounts",   other_inst.get("live_accts", "NA"))
+    b4.metric("Market Outstanding",     _fmt_inr(other_inst.get("outstanding_amt")) if other_inst.get("outstanding_amt") is not None else "NA")
+
+    if bs.get("length_of_credit_history") or bs.get("new_accts_12m") is not None:
+        st.caption(
+            f"Credit history: **{bs.get('length_of_credit_history', 'NA')}**"
+            f"  ·  New accounts (12m): **{bs.get('new_accts_12m', 'NA')}**"
+            f"  ·  New delinquent (12m): **{bs.get('new_delinquent_accts_12m', 'NA')}**"
+        )
+
+    cps = analysis.get("credit_profile_summary") or []
+    derog = analysis.get("derog_summary") or {}
+    col_cps, col_derog = st.columns(2)
+    with col_cps:
+        st.caption("Asset-class distribution (active accounts)")
+        if cps:
+            st.dataframe(
+                pd.DataFrame([{
+                    "Asset Class": b["asset_class"],
+                    "Accounts":    b["count"],
+                    "Outstanding": _fmt_inr(b["outstanding"]),
+                } for b in cps]),
+                hide_index=True, use_container_width=True,
+            )
+        else:
+            st.caption("No active accounts to classify.")
+    with col_derog:
+        st.caption("Derogatory status rollup")
+        # Written Off / Suit Filed show original exposure (sanction amount) -
+        # the bureau zeroes current_balance once an account reaches either
+        # status, so labelling the column plainly "Amount" would otherwise
+        # read as "Rs.0 impact". Settled / Delinquent show current balance,
+        # which is still meaningful for those two.
+        _DEROG_LABEL = {
+            "written_off": "Written Off (orig. exposure)",
+            "suit_filed":  "Suit Filed (orig. exposure)",
+            "settled":     "Settled (balance)",
+            "delinquent":  "Delinquent (balance)",
+        }
+        derog_rows = [
+            (_DEROG_LABEL.get(k, k.replace("_", " ").title()), v["count"], v["amount"])
+            for k, v in derog.items() if v["count"] > 0
+        ]
+        if derog_rows:
+            st.dataframe(
+                pd.DataFrame([{
+                    "Category": r[0], "Accounts": r[1], "Amount": _fmt_inr(r[2]),
+                } for r in derog_rows]),
+                hide_index=True, use_container_width=True,
+            )
+        else:
+            st.caption("No written-off, settled, suit-filed, or delinquent accounts.")
 
 st.divider()
 
