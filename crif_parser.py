@@ -70,10 +70,14 @@ def extract_score(text: str):
 
 def extract_reported_totals(text: str) -> dict:
     """
-    Parse the CRIF Account Summary 12-column table.
-    Active Accounts = col 1, Total Current Balance = col 6.
+    Parse the CRIF Account Summary 12-column table:
+      0 Number of Accounts   1 Active Accounts     2 Overdue Accounts
+      3 Secured Accounts     4 UnSecured Accounts  5 Untagged Accounts
+      6 Total Current Balance  7 Current Balance Secured  8 Current Balance Unsecured
+      9 Total Sanctioned Amount  10 Total Disbursed Amount  11 Total Amount Overdue
     """
-    totals = {"account_count": None, "total_balance": None}
+    totals = {"account_count": None, "total_balance": None,
+              "total_sanction": None, "total_overdue": None}
 
     summary_m = re.search(r'Account\s+Summary\b', text, re.IGNORECASE)
     if not summary_m:
@@ -91,6 +95,12 @@ def extract_reported_totals(text: str) -> dict:
         after    = section[last_hdr_m.end():]
         raw_nums = re.findall(r'\b(\d{1,3}(?:,\d{2,3})*|\d+)\b', after)
         nums     = [to_int(n) for n in raw_nums]
+        if len(nums) >= 12:
+            totals["account_count"]  = nums[1]
+            totals["total_balance"]  = nums[6]
+            totals["total_sanction"] = nums[9]
+            totals["total_overdue"]  = nums[11]
+            return totals
         if len(nums) >= 7:
             totals["account_count"] = nums[1]
             totals["total_balance"]  = nums[6]
@@ -113,11 +123,16 @@ def extract_reported_totals(text: str) -> dict:
             totals["total_balance"] = to_int(m.group(1))
             break
 
-    # PROV2 Account Summary columns:
-    #   Number of Accounts | Active | Overdue | Secured | UnSecured | Untagged | Amounts...
-    # Active is at index 1; Secured + UnSecured == Total (sanity check). The first
-    # comma-amount on the same row is Total Current Balance (the remaining amounts
-    # are its secured/unsecured split, disbursed, sanctioned, overdue).
+    # PROV2 Account Summary columns (OCR dropped the header words but the data
+    # row survives - seen on scanned reports where the primary "Total Amount
+    # Overdue" header regex above can't match because OCR also scrambled the
+    # header word order):
+    #   Number of Accounts | Active | Overdue | Secured | UnSecured | Untagged |
+    #   Total Current Balance | Current Balance Secured | Current Balance Unsecured |
+    #   Total Sanctioned Amount | Total Disbursed Amount | Total Amount Overdue
+    # Active is at index 1; Secured + UnSecured == Total (sanity check). The
+    # comma-amounts on the same row follow that same 6-amount column order,
+    # so amounts[0]=balance, amounts[3]=sanctioned, amounts[5]=overdue.
     if totals["account_count"] is None:
         group_m   = re.search(r'Group\s+Account\s+Summary', section, re.IGNORECASE)
         main_part = section[: group_m.start()] if group_m else section
@@ -132,6 +147,9 @@ def extract_reported_totals(text: str) -> dict:
                     amounts = re.findall(r'\d{1,3}(?:,\d{2,3})+', line)
                     if amounts:
                         totals["total_balance"] = to_int(amounts[0])
+                    if len(amounts) >= 6:
+                        totals["total_sanction"] = to_int(amounts[3])
+                        totals["total_overdue"]  = to_int(amounts[5])
                     break
 
     return totals
@@ -588,6 +606,24 @@ def _is_closed(block: str) -> bool:
     return False
 
 
+def _is_written_off(block: str) -> bool:
+    """
+    Narrower than _is_closed: CRIF Retail has no separate "Written Off"
+    status (unlike Commercial) - a written-off account still just shows
+    "Closed" here. This flags the write-off signal specifically (Remarks
+    text, or a non-zero write-off amount) so the Credit Analysis rollup can
+    report it as its own bucket rather than lumping it into generic Closed.
+    """
+    rem_m = re.search(r'Remarks\s*:\s*\n\s*([^\n]+)', block)
+    if rem_m and re.search(r'written.?off', rem_m.group(1), re.IGNORECASE):
+        return True
+    wo_m = re.search(
+        r'(?:Total\s+)?Write\s*[- ]?[Oo]ff\s+Amt[:\s]*\n?\s*([\d,]+)',
+        block, re.IGNORECASE,
+    )
+    return bool(wo_m and to_int(wo_m.group(1)) != 0)
+
+
 # ─────────────────────────────────────────────────────────────────
 # POSITIONAL LISTS  (entity + loan type from compact summary table)
 # ─────────────────────────────────────────────────────────────────
@@ -661,6 +697,66 @@ def extract_account(acct_num: int, block: str,
         "type_of_loan":     loan_type if loan_type else _extract_loan_type(block),
         "max_dpd":          max(max_dpd, _extract_max_dpd(block)) if max_dpd is not None else _extract_max_dpd(block),
         "status":           "Closed" if _is_closed(block) else "Active",
+        "written_off":      _is_written_off(block),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# PORTFOLIO-LEVEL ANALYSIS  (Credit Analysis sheet / UI section)
+# ─────────────────────────────────────────────────────────────────
+# CRIF Retail's own report has no market-comparison table like Commercial's
+# Borrower Summary (no "your institution vs other institutions" section
+# exists in this report format at all) - so unlike Commercial's analysis,
+# there's no such section here. What IS derivable, the same way Commercial's
+# credit_profile_summary/derog_summary are (from the already-extracted
+# accounts, not re-parsed from a report table that might be truncated):
+# a loan-type distribution and a written-off/overdue rollup.
+
+def credit_profile_summary(accounts: list) -> list:
+    """
+    Loan-type distribution of Active accounts (Personal Loan, Housing Loan,
+    Credit Card, Gold Loan, ...). Returns a list of {asset_class, count,
+    outstanding} sorted by outstanding balance descending - same shape as
+    Commercial's asset-class distribution (asset_class here holds the loan
+    type name, not a DPD bucket) so it renders through the same UI/Excel
+    code with just a different section label.
+    """
+    buckets = {}
+    for a in accounts:
+        if a.get("status") != "Active":
+            continue
+        lt = a.get("type_of_loan") or "Unknown"
+        b = buckets.setdefault(lt, {"count": 0, "outstanding": 0})
+        b["count"] += 1
+        b["outstanding"] += a.get("current_balance") or 0
+    return sorted(
+        [{"asset_class": lt, **v} for lt, v in buckets.items()],
+        key=lambda r: r["outstanding"], reverse=True,
+    )
+
+
+def derog_summary(accounts: list) -> dict:
+    """
+    Rollup of red-flag accounts across all extracted accounts - count and
+    total amount per category. Narrower than Commercial's version: CRIF
+    Retail has no Settled/Suit Filed/Delinquent concepts in this report
+    format, only a write-off signal (folded into "Closed" status - see
+    _is_written_off) and overdue amounts on still-open accounts.
+
+    Written Off uses sanction_amount, not current_balance: the bureau zeroes
+    current_balance once an account is written off, so summing it would show
+    a misleading "Rs.0 impact" for accounts that may carry a large original
+    exposure. Overdue uses the overdue field directly - it's already the
+    "how much is currently past due" figure for a live account.
+    """
+    written_off = [a for a in accounts if a.get("written_off")]
+    overdue     = [a for a in accounts
+                   if a.get("status") == "Active" and (a.get("overdue") or 0) > 0]
+    return {
+        "written_off": {"count": len(written_off),
+                         "amount": sum(a.get("sanction_amount") or 0 for a in written_off)},
+        "overdue":     {"count": len(overdue),
+                         "amount": sum(a.get("overdue") or 0 for a in overdue)},
     }
 
 

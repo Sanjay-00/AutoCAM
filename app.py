@@ -482,39 +482,49 @@ if data["extraction_method"] == METHOD_OCR:
         "delinquent (non-zero DPD) account before relying on it."
     )
 
-# ── Credit Analysis  (CRIF Commercial only)  ───────────────────────
+# ── Credit Analysis  (CRIF Retail + Commercial - shapes differ)  ───
 analysis = data.get("analysis")
 if analysis:
     st.divider()
     st.markdown("#### 📑 Credit Analysis")
 
+    # borrower_summary (market comparison) only exists for CRIF Commercial -
+    # Retail's report format has no "your institution vs other institutions"
+    # table to pull this from at all, so it's simply absent from Retail's
+    # analysis dict rather than rendered full of misleading "NA" metrics.
     bs = analysis.get("borrower_summary") or {}
-    your_inst  = bs.get("your_institution")  or {}
-    other_inst = bs.get("other_institution") or {}
+    if bs:
+        your_inst  = bs.get("your_institution")  or {}
+        other_inst = bs.get("other_institution") or {}
 
-    st.caption("Our exposure vs the market")
-    b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Our Live Accounts",      your_inst.get("live_accts", "NA"))
-    b2.metric("Our Outstanding",        _fmt_inr(your_inst.get("outstanding_amt")) if your_inst.get("outstanding_amt") is not None else "NA")
-    b3.metric("Market Live Accounts",   other_inst.get("live_accts", "NA"))
-    b4.metric("Market Outstanding",     _fmt_inr(other_inst.get("outstanding_amt")) if other_inst.get("outstanding_amt") is not None else "NA")
+        st.caption("Our exposure vs the market")
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Our Live Accounts",      your_inst.get("live_accts", "NA"))
+        b2.metric("Our Outstanding",        _fmt_inr(your_inst.get("outstanding_amt")) if your_inst.get("outstanding_amt") is not None else "NA")
+        b3.metric("Market Live Accounts",   other_inst.get("live_accts", "NA"))
+        b4.metric("Market Outstanding",     _fmt_inr(other_inst.get("outstanding_amt")) if other_inst.get("outstanding_amt") is not None else "NA")
 
-    if bs.get("length_of_credit_history") or bs.get("new_accts_12m") is not None:
-        st.caption(
-            f"Credit history: **{bs.get('length_of_credit_history', 'NA')}**"
-            f"  ·  New accounts (12m): **{bs.get('new_accts_12m', 'NA')}**"
-            f"  ·  New delinquent (12m): **{bs.get('new_delinquent_accts_12m', 'NA')}**"
-        )
+        if bs.get("length_of_credit_history") or bs.get("new_accts_12m") is not None:
+            st.caption(
+                f"Credit history: **{bs.get('length_of_credit_history', 'NA')}**"
+                f"  ·  New accounts (12m): **{bs.get('new_accts_12m', 'NA')}**"
+                f"  ·  New delinquent (12m): **{bs.get('new_delinquent_accts_12m', 'NA')}**"
+            )
 
     cps = analysis.get("credit_profile_summary") or []
     derog = analysis.get("derog_summary") or {}
     col_cps, col_derog = st.columns(2)
     with col_cps:
-        st.caption("Asset-class distribution (active accounts)")
+        # Commercial buckets by DPD/asset classification; Retail (no such
+        # classification in this report format) buckets by loan type instead -
+        # same {asset_class, count, outstanding} shape either way.
+        cps_col_label = "Asset Class" if bs else "Loan Type"
+        st.caption("Asset-class distribution (active accounts)" if bs
+                   else "Loan-type distribution (active accounts)")
         if cps:
             st.dataframe(
                 pd.DataFrame([{
-                    "Asset Class": b["asset_class"],
+                    cps_col_label: b["asset_class"],
                     "Accounts":    b["count"],
                     "Outstanding": _fmt_inr(b["outstanding"]),
                 } for b in cps]),
@@ -528,12 +538,16 @@ if analysis:
         # the bureau zeroes current_balance once an account reaches either
         # status, so labelling the column plainly "Amount" would otherwise
         # read as "Rs.0 impact". Settled / Delinquent show current balance,
-        # which is still meaningful for those two.
+        # which is still meaningful for those two. Retail's derog_summary()
+        # only ever returns written_off/overdue (no Settled/Suit Filed/
+        # Delinquent concept in that report format) - the dict simply won't
+        # have the other keys, so they don't appear here either.
         _DEROG_LABEL = {
             "written_off": "Written Off (orig. exposure)",
             "suit_filed":  "Suit Filed (orig. exposure)",
             "settled":     "Settled (balance)",
             "delinquent":  "Delinquent (balance)",
+            "overdue":     "Overdue (active accounts)",
         }
         derog_rows = [
             (_DEROG_LABEL.get(k, k.replace("_", " ").title()), v["count"], v["amount"])
