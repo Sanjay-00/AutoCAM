@@ -198,7 +198,7 @@ def generate_excel(data: dict) -> bytes:
     ws["B2"] = score_display
     ws["B2"].font      = _f(size=14, bold=True, color=score_color)
     ws["B2"].fill      = score_fill
-    ws["B2"].alignment = _a("center")
+    ws["B2"].alignment = _a("left")
     ws.row_dimensions[2].height = 22
 
     # ────────────────────────────────────────
@@ -333,9 +333,16 @@ def generate_excel(data: dict) -> bytes:
                     cell.alignment = _a("center")
 
             elif col_idx == 11:   # Status
-                cell.fill = row_bg
                 status_color = STATUS_COLORS.get(status_raw, CLOSED_GREY)
-                cell.font = _f(color=status_color, bold=(status_raw == "Active"))
+                if acc.get("delinquent"):
+                    # Amber tint (same as 'Check CIBIL' cells) so a delinquent
+                    # account stands out at a glance, not just in the "(Delinquent)"
+                    # text - matches the app's row highlight for the same accounts.
+                    cell.fill = _fill("FFF2CC")
+                    cell.font = _f(color="7F6000", bold=True)
+                else:
+                    cell.fill = row_bg
+                    cell.font = _f(color=status_color, bold=(status_raw == "Active"))
                 cell.alignment = _a("center")
 
         ws.row_dimensions[row_num].height = 16
@@ -456,7 +463,7 @@ def _kv_row(ws, row, label, value, number_format=None):
 
 def _build_credit_analysis_sheet(wb, analysis: dict) -> None:
     ws = wb.create_sheet("Credit Analysis")
-    for col, width in zip("ABCDEF", (28, 20, 18, 18, 20, 20)):
+    for col, width in zip("ABCDEFGHI", (28, 20, 18, 18, 20, 20, 22, 18, 18)):
         ws.column_dimensions[col].width = width
 
     row = 1
@@ -465,48 +472,58 @@ def _build_credit_analysis_sheet(wb, analysis: dict) -> None:
     row += 2
 
     # ── Borrower Summary: Shriram's own book vs the rest of the market ──
+    # CRIF Commercial only - Retail's report format has no market-comparison
+    # table to pull this from at all (borrower_summary key is simply absent
+    # for Retail's analysis dict), so this whole section is skipped rather
+    # than rendered full of misleading "NA" rows.
     bs = analysis.get("borrower_summary") or {}
-    row = _section_header(ws, row, "Borrower Summary  -  Our Exposure vs Market")
+    if bs:
+        row = _section_header(ws, row, "Borrower Summary  -  Our Exposure vs Market")
 
-    headers = ["", "Lenders", "Total Accts", "Live Accts", "Delinquent Accts",
-              "Sanctioned (Rs.)", "Outstanding (Rs.)", "Overdue (Rs.)", "PAR 90+ (Rs.)"]
-    for col_idx, h in enumerate(headers, 1):
-        c = ws.cell(row=row, column=col_idx, value=h)
-        c.font = _f(bold=True, color=NAVY)
-        c.fill = _fill(LIGHT_GREY)
-        c.border = _b()
-    row += 1
-
-    for label, key in (("Your Institution (Shriram)", "your_institution"),
-                       ("Other Institutions (Market)", "other_institution")):
-        inst = bs.get(key) or {}
-        values = [
-            label,
-            inst.get("lenders"), inst.get("total_accts"), inst.get("live_accts"),
-            inst.get("delinquent_accts"),
-            inst.get("sanctioned_amt"), inst.get("outstanding_amt"),
-            inst.get("overdue_amt"), inst.get("par_90plus"),
-        ]
-        for col_idx, v in enumerate(values, 1):
-            c = ws.cell(row=row, column=col_idx, value=v if v is not None else "NA")
+        headers = ["", "Lenders", "Total Accts", "Live Accts", "Delinquent Accts",
+                  "Sanctioned (Rs.)", "Outstanding (Rs.)", "Overdue (Rs.)", "PAR 90+ (Rs.)"]
+        for col_idx, h in enumerate(headers, 1):
+            c = ws.cell(row=row, column=col_idx, value=h)
+            c.font = _f(bold=True, color=NAVY)
+            c.fill = _fill(LIGHT_GREY)
             c.border = _b()
-            if col_idx == 1:
-                c.font = _f(bold=True)
-            elif col_idx >= 6:
-                c.number_format = '#,##0;-#,##0;"NA"'
-                c.alignment = _a("right")
         row += 1
-    row += 1
 
-    row = _kv_row(ws, row, "Length of Credit History:", bs.get("length_of_credit_history"))
-    row = _kv_row(ws, row, "New Accounts (last 12 months):", bs.get("new_accts_12m"))
-    row = _kv_row(ws, row, "Closed Accounts (last 12 months):", bs.get("closed_accts_12m"))
-    row = _kv_row(ws, row, "New Delinquent Accounts (last 12 months):", bs.get("new_delinquent_accts_12m"))
-    row += 2
+        for label, key in (("Your Institution (Shriram)", "your_institution"),
+                           ("Other Institutions (Market)", "other_institution")):
+            inst = bs.get(key) or {}
+            values = [
+                label,
+                inst.get("lenders"), inst.get("total_accts"), inst.get("live_accts"),
+                inst.get("delinquent_accts"),
+                inst.get("sanctioned_amt"), inst.get("outstanding_amt"),
+                inst.get("overdue_amt"), inst.get("par_90plus"),
+            ]
+            for col_idx, v in enumerate(values, 1):
+                c = ws.cell(row=row, column=col_idx, value=v if v is not None else "NA")
+                c.border = _b()
+                if col_idx == 1:
+                    c.font = _f(bold=True)
+                elif col_idx >= 6:
+                    c.number_format = '#,##0;-#,##0;"NA"'
+                    c.alignment = _a("right")
+            row += 1
+        row += 1
 
-    # ── Credit Profile Summary: asset-class distribution ──
-    row = _section_header(ws, row, "Credit Profile Summary  -  Asset-Class Distribution (Active Accounts)")
-    for col_idx, h in enumerate(["Asset Class", "Accounts", "Outstanding Balance (Rs.)"], 1):
+        row = _kv_row(ws, row, "Length of Credit History:", bs.get("length_of_credit_history"))
+        row = _kv_row(ws, row, "New Accounts (last 12 months):", bs.get("new_accts_12m"))
+        row = _kv_row(ws, row, "Closed Accounts (last 12 months):", bs.get("closed_accts_12m"))
+        row = _kv_row(ws, row, "New Delinquent Accounts (last 12 months):", bs.get("new_delinquent_accts_12m"))
+        row += 2
+
+    # ── Credit Profile Summary: asset-class (Commercial) / loan-type (Retail)
+    #    distribution - same shape either way, just a different label.
+    section_label = ("Credit Profile Summary  -  Asset-Class Distribution (Active Accounts)"
+                     if bs else
+                     "Credit Profile Summary  -  Loan-Type Distribution (Active Accounts)")
+    row = _section_header(ws, row, section_label)
+    col1_header = "Asset Class" if bs else "Loan Type"
+    for col_idx, h in enumerate([col1_header, "Accounts", "Outstanding Balance (Rs.)"], 1):
         c = ws.cell(row=row, column=col_idx, value=h)
         c.font = _f(bold=True, color=NAVY)
         c.fill = _fill(LIGHT_GREY)
@@ -546,13 +563,22 @@ def _build_credit_analysis_sheet(wb, analysis: dict) -> None:
     # bureau zeroes current_balance once an account reaches either status, so
     # a plain "Amount" column would otherwise read as "Rs.0 impact". Settled /
     # Delinquent show current balance, which is still meaningful for those two.
-    for label, key, color in (
-        ("Written Off (orig. exposure)", "written_off", WRITEOFF_RED),
-        ("Settled (balance)",            "settled",     SETTLED_AMBER),
-        ("Suit Filed (orig. exposure)",  "suit_filed",  WRITEOFF_RED),
-        ("Delinquent (balance)",         "delinquent",  "843C0C"),
-    ):
-        d = derog.get(key) or {"count": 0, "amount": 0}
+    # Rows are driven by which keys the analysis dict actually has - Retail's
+    # derog_summary() only ever returns written_off/overdue (no Settled/Suit
+    # Filed/Delinquent concept in that report format), Commercial's returns
+    # all four of its own set. Order is fixed regardless of which subset shows.
+    _DEROG_ROW_STYLE = {
+        "written_off": ("Written Off (orig. exposure)", WRITEOFF_RED),
+        "settled":     ("Settled (balance)",             SETTLED_AMBER),
+        "suit_filed":  ("Suit Filed (orig. exposure)",   WRITEOFF_RED),
+        "delinquent":  ("Delinquent (balance)",          "843C0C"),
+        "overdue":     ("Overdue (active accounts)",     "843C0C"),
+    }
+    for key in ("written_off", "settled", "suit_filed", "delinquent", "overdue"):
+        if key not in derog:
+            continue
+        label, color = _DEROG_ROW_STYLE[key]
+        d = derog[key]
         cells = [label, d["count"], d["amount"]]
         for col_idx, v in enumerate(cells, 1):
             c = ws.cell(row=row, column=col_idx, value=v)

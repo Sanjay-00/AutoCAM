@@ -14,7 +14,11 @@ import json
 import time
 import fitz  # PyMuPDF
 
-from crif_parser import parse_crif, extract_reported_totals, split_account_blocks
+from crif_parser import (
+    parse_crif, extract_reported_totals, split_account_blocks,
+    credit_profile_summary as crif_credit_profile_summary,
+    derog_summary as crif_derog_summary,
+)
 from crif_parser import _is_closed, _extract_balance, _extract_entity
 from crif_commercial_parser import parse_crif_commercial, credit_profile_summary, derog_summary
 from tu_parser   import parse_transunion
@@ -693,6 +697,10 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
         "validation":        validation,
         "provider":          "crif",
         "tesseract_version": ocr_extractor.tesseract_version() if scanned else None,
+        "analysis": {
+            "credit_profile_summary": crif_credit_profile_summary(accounts),
+            "derog_summary":          crif_derog_summary(accounts),
+        },
     }
 
 
