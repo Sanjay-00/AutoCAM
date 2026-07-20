@@ -465,20 +465,51 @@ def vision_extract_accounts(doc, page_indices: list, api_key: str,
     whose JSON would blow past the model's output-token cap in a single call.
     Each chunk's accounts are concatenated; the caller renumbers. Returns [] on
     total failure (individual chunk failures are skipped).
+
+    Chunks are independent Gemini calls, so - same as the DPD Vision pass in
+    parser._enrich_dpd_vision - all page images are rendered on the main
+    thread first (PyMuPDF isn't thread-safe), then the Gemini calls for every
+    chunk run in parallel. Turns ~N-chunks x several-seconds into ~one
+    chunk's worth of wall time.
     """
     if not page_indices:
         return []
 
-    all_accounts = []
-    for start in range(0, len(page_indices), chunk_size):
-        chunk = page_indices[start:start + chunk_size]
+    chunks = [page_indices[start:start + chunk_size]
+              for start in range(0, len(page_indices), chunk_size)]
+
+    chunk_contents = []
+    for chunk in chunks:
         content = [{"type": "text", "text": _VISION_PROMPT}]
         for idx in chunk:
             content.append({"type": "image_url", "image_url": _img_data_uri(doc[idx])})
+        chunk_contents.append(content)
+
+    if len(chunk_contents) == 1:
         try:
-            accounts = postprocess_fn(invoke_fn(api_key, content))
-            if isinstance(accounts, list):
-                all_accounts.extend(accounts)
+            accounts = postprocess_fn(invoke_fn(api_key, chunk_contents[0]))
+            return accounts if isinstance(accounts, list) else []
         except Exception:
-            continue
+            return []
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results = [None] * len(chunk_contents)
+
+    def _call(i):
+        return i, postprocess_fn(invoke_fn(api_key, chunk_contents[i]))
+
+    with ThreadPoolExecutor(max_workers=min(len(chunk_contents), 8)) as pool:
+        futures = [pool.submit(_call, i) for i in range(len(chunk_contents))]
+        for fut in as_completed(futures):
+            try:
+                i, accounts = fut.result()
+                results[i] = accounts if isinstance(accounts, list) else None
+            except Exception:
+                continue
+
+    all_accounts = []
+    for accounts in results:
+        if accounts:
+            all_accounts.extend(accounts)
     return all_accounts
