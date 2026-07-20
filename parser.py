@@ -115,15 +115,48 @@ def _detect_provider(text: str) -> str:
 # CRIF VALIDATION
 # ─────────────────────────────────────────────────────────────────
 
-def validate_extraction(accounts: list, reported: dict) -> dict:
-    """CRIF validation: active count + active balance vs Account Summary."""
-    issues  = []
-    active  = [a for a in accounts if a.get("status") == "Active"]
-    count   = len(active)
-    balance = sum(a.get("current_balance") or 0 for a in active)
+def validate_extraction(accounts: list, reported: dict, amount_floor: int = 1000,
+                         overdue_floor: int = 50_000) -> dict:
+    """CRIF validation: active count + active balance (+ sanction/overdue on
+    CRIF Commercial, where the Borrower Summary prints them) vs the report's
+    own summary.
 
-    exp_count = reported.get("account_count")
-    exp_bal   = reported.get("total_balance")
+    amount_floor is the minimum absolute tolerance under the 5% relative
+    check (balance/sanction only), in rupees. CRIF Retail's Account Summary
+    prints exact rupee digits, so the default Rs.1000 (rounding/OCR noise) is
+    right there. CRIF Commercial's Borrower Summary instead prints
+    2-decimal Crores - Rs.1,00,000 (1 lakh) per unit - so the caller passes
+    Rs.50,000 (half a lakh) for that provider; using the tighter default
+    there would flag the bureau's own summary-table rounding as an
+    extraction error.
+
+    overdue_floor is a flat (not %-of-expected) absolute tolerance for
+    Overdue specifically - deliberately no percentage component at all,
+    since a 5%-of-expected check breaks down exactly where it matters most:
+    Overdue is very often reported as Rs.0 (nothing overdue), and 5% of
+    zero is zero, which would flag ANY genuinely-small real overdue amount
+    (e.g. our Rs.30,000 vs the bureau's Rs.0) as a mismatch even though it's
+    well within the summary table's own Rs.1-lakh rounding precision."""
+    issues     = []
+    active     = [a for a in accounts if a.get("status") == "Active"]
+    count      = len(active)
+    balance    = sum(a.get("current_balance") or 0 for a in active)
+    sanction   = sum(a.get("sanction_amount") or 0 for a in active)
+    overdue    = sum(a.get("overdue") or 0 for a in active)
+    delinquent = sum(1 for a in active if a.get("delinquent"))
+
+    exp_count    = reported.get("account_count")
+    exp_bal      = reported.get("total_balance")
+    exp_sanction = reported.get("total_sanction")
+    exp_overdue  = reported.get("total_overdue")
+
+    # Per-field pass/fail, computed with the exact same thresholds used below
+    # to raise issues - callers (app.py's validation badge) must read these
+    # rather than re-deriving their own tolerance, so the UI's tick/cross can
+    # never disagree with what actually determined `valid`.
+    balance_ok  = (not exp_bal) or abs(balance - exp_bal) <= max(exp_bal * 0.05, amount_floor)
+    sanction_ok = (not exp_sanction) or abs(sanction - exp_sanction) <= max(exp_sanction * 0.05, amount_floor)
+    overdue_ok  = (exp_overdue is None) or abs(overdue - exp_overdue) <= overdue_floor
 
     # Zero accounts extracted is only a genuine pass when the report's own
     # summary totals confirm it (e.g. a real thin-file/no-trade-history
@@ -139,25 +172,54 @@ def validate_extraction(accounts: list, reported: dict) -> dict:
             "report, or a parsing failure. Please check the source manually."
         )
     else:
+        # CRIF Commercial's "Live Accts" figure deliberately excludes
+        # delinquent-but-open accounts, while our extraction correctly
+        # counts a delinquent (still open, balance > 0) facility as Active -
+        # see crif_commercial_parser._parse_summary_row_full. When the gap
+        # is fully explained by that (extracted active minus delinquent
+        # equals the report's own count), it's not an extraction error, so
+        # don't raise it as one - a mismatch that isn't explained this way
+        # still gets flagged, same as before.
         if exp_count is not None and count != exp_count:
-            issues.append(
-                f"Active account count mismatch: extracted {count}, "
-                f"report says {exp_count}"
-            )
+            if not (delinquent and count - delinquent == exp_count):
+                issues.append(
+                    f"Active account count mismatch: extracted {count}, "
+                    f"report says {exp_count}"
+                )
         if exp_bal and exp_bal > 0:
-            if abs(balance - exp_bal) > max(exp_bal * 0.05, 1000):
+            if abs(balance - exp_bal) > max(exp_bal * 0.05, amount_floor):
                 issues.append(
                     f"Balance mismatch: extracted Rs.{balance:,}, "
                     f"report says Rs.{exp_bal:,}"
                 )
+        if exp_sanction and exp_sanction > 0:
+            if abs(sanction - exp_sanction) > max(exp_sanction * 0.05, amount_floor):
+                issues.append(
+                    f"Sanctioned amount mismatch: extracted Rs.{sanction:,}, "
+                    f"report says Rs.{exp_sanction:,}"
+                )
+        if exp_overdue is not None:
+            if abs(overdue - exp_overdue) > overdue_floor:
+                issues.append(
+                    f"Overdue amount mismatch: extracted Rs.{overdue:,}, "
+                    f"report says Rs.{exp_overdue:,}"
+                )
 
     return {
-        "valid":             len(issues) == 0,
-        "issues":            issues,
-        "extracted_count":   count,
-        "extracted_balance": balance,
-        "expected_count":    exp_count,
-        "expected_balance":  exp_bal,
+        "valid":               len(issues) == 0,
+        "issues":              issues,
+        "extracted_count":     count,
+        "extracted_balance":   balance,
+        "extracted_sanction":  sanction,
+        "extracted_overdue":   overdue,
+        "expected_count":      exp_count,
+        "expected_balance":    exp_bal,
+        "expected_sanction":   exp_sanction,
+        "expected_overdue":    exp_overdue,
+        "delinquent_active_count": delinquent,
+        "balance_ok":          balance_ok,
+        "sanction_ok":         sanction_ok,
+        "overdue_ok":          overdue_ok,
     }
 
 
@@ -464,8 +526,21 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
     name, score, blocks, accounts, reported, analysis = parse_crif_commercial(text, scanned)
     _renumber(accounts)
 
+    # Borrower Summary carries Sanctioned/Overdue totals alongside the
+    # Live-Accts/Outstanding pair extract_reported_totals() already puts in
+    # `reported` - fold them in here so validate_extraction() can check them
+    # too, the same way it already checks balance.
+    bs = analysis.get("borrower_summary") or {}
+    yi, oi = bs.get("your_institution") or {}, bs.get("other_institution") or {}
+    if yi.get("sanctioned_amt") is not None or oi.get("sanctioned_amt") is not None:
+        reported["total_sanction"] = (yi.get("sanctioned_amt") or 0) + (oi.get("sanctioned_amt") or 0)
+    if yi.get("overdue_amt") is not None or oi.get("overdue_amt") is not None:
+        reported["total_overdue"] = (yi.get("overdue_amt") or 0) + (oi.get("overdue_amt") or 0)
+
     method     = METHOD_OCR if scanned else METHOD_RULE_BASED
-    validation = validate_extraction(accounts, reported)
+    # CRIF Commercial's amounts come from the Borrower Summary's 2-decimal-Crore
+    # figures (1 lakh precision) - see validate_extraction()'s amount_floor note.
+    validation = validate_extraction(accounts, reported, amount_floor=50_000)
 
     # Recommend the Gemini fallback rather than using it automatically - only
     # runs once the user has ticked the checkbox (enrich_dpd).
@@ -481,7 +556,7 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
         )
         if vis:
             _renumber(vis)
-            v_vis = validate_extraction(vis, reported)
+            v_vis = validate_extraction(vis, reported, amount_floor=50_000)
             if _val_quality(v_vis) > _val_quality(validation):
                 accounts, validation, method = vis, v_vis, METHOD_VISION
 

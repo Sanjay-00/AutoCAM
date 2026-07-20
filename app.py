@@ -126,25 +126,56 @@ def _validation_badge(v):
     # Current balance is the authoritative check; active count is secondary (the
     # bureau itself sometimes mislabels active/closed, and a misclassified
     # zero-balance account doesn't move the balance total).
-    bal_ok = (not exp_b) or abs((v.get("extracted_balance") or 0) - exp_b) <= max(exp_b * 0.05, 1000)
-    cnt_ok = (exp_c is None) or (v.get("extracted_count") == exp_c)
+    extracted_c = v.get("extracted_count")
+    delinquent  = v.get("delinquent_active_count", 0)
+    # CRIF Commercial's "Live Accts" figure deliberately excludes delinquent-
+    # but-open accounts, which our extraction correctly counts as Active -
+    # a raw count mismatch fully explained by that isn't an extraction error.
+    delinquent_explains_gap = bool(
+        delinquent and exp_c is not None and extracted_c is not None
+        and extracted_c - delinquent == exp_c
+    )
+    exp_s, exp_o = v.get("expected_sanction"), v.get("expected_overdue")
+    # Reuse parser.validate_extraction's own pass/fail per field instead of
+    # re-deriving thresholds here - a second, independent formula drifted out
+    # of sync with the real one (esp. for Overdue, which uses a flat rupee
+    # floor, not a %-of-expected check) and could show a tick/cross that
+    # disagreed with the actual validation result.
+    bal_ok = v.get("balance_ok", True)
+    san_ok = v.get("sanction_ok", True)
+    ovd_ok = v.get("overdue_ok", True)
+    cnt_ok = (exp_c is None) or (extracted_c == exp_c) or delinquent_explains_gap
 
     lines = []
     if exp_b:
         lines.append(f"{'✅' if bal_ok else '❌'}  Current balance: "
                      f"{_fmt_inr(v['extracted_balance'])} / {_fmt_inr(exp_b)} (summary)")
+    if exp_s:
+        lines.append(f"{'✅' if san_ok else '❌'}  Sanctioned amount: "
+                     f"{_fmt_inr(v['extracted_sanction'])} / {_fmt_inr(exp_s)} (summary)")
+    if exp_o is not None:
+        lines.append(f"{'✅' if ovd_ok else '❌'}  Overdue amount: "
+                     f"{_fmt_inr(v['extracted_overdue'])} / {_fmt_inr(exp_o)} (summary)")
     if exp_c is not None:
-        lines.append(f"{'✅' if cnt_ok else '⚠️'}  Active accounts: "
-                     f"{v.get('extracted_count')} / {exp_c} (summary)")
+        if delinquent_explains_gap:
+            lines.append(
+                f"✅  Active accounts: {extracted_c} / {exp_c} (summary)  -  "
+                f"{delinquent} of these are delinquent-but-open, which the "
+                f"bureau's Live Accts figure excludes"
+            )
+        else:
+            lines.append(f"{'✅' if cnt_ok else '⚠️'}  Active accounts: "
+                         f"{extracted_c} / {exp_c} (summary)")
     body = "\n\n".join(lines)
+    amt_ok = bal_ok and san_ok and ovd_ok
 
-    if bal_ok and cnt_ok:
+    if amt_ok and cnt_ok:
         st.success("✅  Validation passed\n\n" + body)
-    elif bal_ok:
-        st.warning("⚠️  Balance matches the summary, but the active count differs  -  "
+    elif amt_ok:
+        st.warning("⚠️  Amounts match the summary, but the active count differs  -  "
                    "often a bureau active/closed labelling difference. Please review.\n\n" + body)
     else:
-        st.error("❌  Balance does not match the summary  -  review the extraction.\n\n" + body)
+        st.error("❌  An amount does not match the summary  -  review the extraction.\n\n" + body)
 
 
 _CHECK_CIBIL = "Check CIBIL"
@@ -181,6 +212,16 @@ def _to_df(accounts: list) -> pd.DataFrame:
         "Max DPD":          _amt(a["max_dpd"]),
         "Status":           _status_display(a),
     } for a in accounts])
+
+
+def _style_delinquent(df: pd.DataFrame):
+    """Amber text (no background fill - a solid fill fights the app's dark
+    theme) for delinquent accounts, so they're visible at a glance in the
+    table, not just readable in the Status text."""
+    def highlight(row):
+        style = "color: #E8A33D; font-weight: 600" if "Delinquent" in row["Status"] else ""
+        return [style] * len(row)
+    return df.style.apply(highlight, axis=1)
 
 
 _COL_CFG = {
@@ -220,57 +261,69 @@ with col_dpd:
              "Adds ~15s and costs ~₹0.17 per report. Re-run extraction after ticking.",
     )
 
-if not (uploaded and run):
-    st.stop()
+# Identifies "this exact upload + these exact options" so a rerun triggered
+# by something other than the Extract button (Download click, sorting a
+# dataframe, expanding an st.expander, ...) can reuse the already-parsed
+# result instead of re-running OCR/LLM fallback from scratch - `run` itself
+# resets to False on every rerun except the one click that set it, so without
+# this cache every such interaction silently threw away the result and forced
+# a full re-parse (minutes, on a scanned report) just to click Download.
+file_key = (uploaded.name, uploaded.size, use_vision_dpd) if uploaded is not None else None
 
-# ── Parse ─────────────────────────────────────────────────────────
-_progress_bar  = st.progress(0, text="Reading PDF…")
-_status_text   = st.empty()
+if uploaded and run:
+    # ── Parse ─────────────────────────────────────────────────────
+    _progress_bar  = st.progress(0, text="Reading PDF…")
+    _status_text   = st.empty()
 
+    def _on_ocr_progress(current: int, total: int):
+        pct = int(current / total * 100)
+        if current == total:
+            # After the last page, parser.parse() still has validation and (if
+            # that fails and an API key is set) a blocking Gemini correction call
+            # ahead of it - neither has a progress callback of its own, so
+            # without this the UI would sit on "page N of N" for several more
+            # seconds with nothing updating, reading as a frozen page rather
+            # than as still working.
+            _progress_bar.progress(100, text="OCR complete - validating extraction…")
+            _status_text.caption(
+                "Checking extracted totals against the report's own summary - if a "
+                "correction pass is needed this can take a few more seconds."
+            )
+        else:
+            _progress_bar.progress(pct, text=f"Scanning page {current} of {total}…")
+            _status_text.caption(
+                f"OCR in progress · {current}/{total} pages done"
+                + ("  -  this takes a few minutes for large scanned reports" if current == 1 else "")
+            )
 
-def _on_ocr_progress(current: int, total: int):
-    pct = int(current / total * 100)
-    if current == total:
-        # After the last page, parser.parse() still has validation and (if
-        # that fails and an API key is set) a blocking Gemini correction call
-        # ahead of it - neither has a progress callback of its own, so
-        # without this the UI would sit on "page N of N" for several more
-        # seconds with nothing updating, reading as a frozen page rather
-        # than as still working.
-        _progress_bar.progress(100, text="OCR complete - validating extraction…")
+    def _on_dpd_progress(done: int, total: int):
+        _progress_bar.progress(100, text=f"Enriching DPD via Vision… page {done} of {total}")
         _status_text.caption(
-            "Checking extracted totals against the report's own summary - if a "
-            "correction pass is needed this can take a few more seconds."
-        )
-    else:
-        _progress_bar.progress(pct, text=f"Scanning page {current} of {total}…")
-        _status_text.caption(
-            f"OCR in progress · {current}/{total} pages done"
-            + ("  -  this takes a few minutes for large scanned reports" if current == 1 else "")
+            f"Reading coloured payment-history cells with Gemini Vision · {done}/{total} pages"
         )
 
+    try:
+        data = parse(uploaded, api_key=_load_api_key(), on_progress=_on_ocr_progress,
+                     on_dpd_progress=_on_dpd_progress if use_vision_dpd else None,
+                     enrich_dpd=use_vision_dpd)
+    except Exception as e:
+        _progress_bar.empty()
+        _status_text.empty()
+        st.error(f"Parsing failed: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        st.stop()
 
-def _on_dpd_progress(done: int, total: int):
-    _progress_bar.progress(100, text=f"Enriching DPD via Vision… page {done} of {total}")
-    _status_text.caption(
-        f"Reading coloured payment-history cells with Gemini Vision · {done}/{total} pages"
-    )
-
-
-try:
-    data = parse(uploaded, api_key=_load_api_key(), on_progress=_on_ocr_progress,
-                 on_dpd_progress=_on_dpd_progress if use_vision_dpd else None,
-                 enrich_dpd=use_vision_dpd)
-except Exception as e:
     _progress_bar.empty()
     _status_text.empty()
-    st.error(f"Parsing failed: {e}")
-    import traceback
-    st.code(traceback.format_exc())
-    st.stop()
 
-_progress_bar.empty()
-_status_text.empty()
+    st.session_state["data"]        = data
+    st.session_state["data_key"]    = file_key
+    st.session_state["excel_bytes"] = None  # stale - regenerated below on next use
+
+data = st.session_state.get("data")
+if data is None or file_key is None or st.session_state.get("data_key") != file_key:
+    st.stop()
 
 accounts = data["accounts"]
 active   = [a for a in accounts if a["status"] == "Active"]
@@ -278,6 +331,12 @@ active   = [a for a in accounts if a["status"] == "Active"]
 # too, and every account must land in Active or here so the tab counts
 # always add up to the total (no account silently disappears from both).
 closed   = [a for a in accounts if a["status"] != "Active"]
+# Delinquent is an overlay flag on top of Active (still open, not a separate
+# bucket in `accounts`), but the bureau's own "Live Accts" summary figure
+# excludes it - a blended "Active" metric that silently includes delinquent
+# accounts reads as a mismatch against that figure even when extraction is
+# correct. Split it out as its own tile instead of hiding it inside Active.
+delinquent = [a for a in active if a.get("delinquent")]
 name     = data["name"]
 score    = data["score"]
 
@@ -296,12 +355,25 @@ with right:
 st.divider()
 
 # ── Key metrics  -  row 1 ───────────────────────────────────────────
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Total Accounts",  len(accounts))
-c2.metric("Active",          len(active))
-c3.metric("Closed",          len(closed))
-c4.metric("Active Balance",  _fmt_inr(total_balance))
-c5.metric("Total Overdue",   _fmt_inr(total_overdue))
+# CRIF Commercial only: Active is split into a pure count and its own
+# Delinquent tile so the headline numbers match the bureau's own Live
+# Accts / Delinquent Accts split (see `delinquent` above) instead of one
+# blended "Active" figure that looks inconsistent with the report.
+if data.get("provider") == "crif_commercial":
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Total Accounts",  len(accounts))
+    c2.metric("Active",          len(active) - len(delinquent))
+    c3.metric("Delinquent",      len(delinquent))
+    c4.metric("Closed",          len(closed))
+    c5.metric("Active Balance",  _fmt_inr(total_balance))
+    c6.metric("Total Overdue",   _fmt_inr(total_overdue))
+else:
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total Accounts",  len(accounts))
+    c2.metric("Active",          len(active))
+    c3.metric("Closed",          len(closed))
+    c4.metric("Active Balance",  _fmt_inr(total_balance))
+    c5.metric("Total Overdue",   _fmt_inr(total_overdue))
 
 # row 2
 d1, d2, d3, d4, d5 = st.columns(5)
@@ -386,10 +458,12 @@ tab_all, tab_active, tab_closed = st.tabs([
 ])
 
 with tab_all:
-    st.dataframe(_to_df(accounts), column_config=_COL_CFG, use_container_width=True, hide_index=True)
+    st.dataframe(_style_delinquent(_to_df(accounts)), column_config=_COL_CFG, use_container_width=True, hide_index=True)
 with tab_active:
     if active:
-        st.dataframe(_to_df(active), column_config=_COL_CFG, use_container_width=True, hide_index=True)
+        if delinquent:
+            st.caption(f"🟠 **{len(delinquent)}** of these are delinquent-but-open (highlighted below).")
+        st.dataframe(_style_delinquent(_to_df(active)), column_config=_COL_CFG, use_container_width=True, hide_index=True)
     else:
         st.info("No active accounts.")
 with tab_closed:
@@ -480,7 +554,13 @@ st.divider()
 # ── Download ──────────────────────────────────────────────────────
 _, dl_col, _ = st.columns([1, 3, 1])
 with dl_col:
-    excel_bytes = generate_excel(data)
+    # Cached alongside `data` (invalidated only when a fresh parse runs) so
+    # clicking Download itself - which triggers a Streamlit rerun - doesn't
+    # regenerate the workbook from scratch every time.
+    excel_bytes = st.session_state.get("excel_bytes")
+    if excel_bytes is None:
+        excel_bytes = generate_excel(data)
+        st.session_state["excel_bytes"] = excel_bytes
     fname       = get_filename(name)
     st.download_button(
         label=f"⬇️  Download Excel   -   {fname}",
