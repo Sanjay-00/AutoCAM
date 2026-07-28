@@ -217,11 +217,15 @@ def _to_df(accounts: list) -> pd.DataFrame:
 def _style_delinquent(df: pd.DataFrame):
     """Amber text (no background fill - a solid fill fights the app's dark
     theme) for delinquent accounts, so they're visible at a glance in the
-    table, not just readable in the Status text."""
-    def highlight(row):
-        style = "color: #E8A33D; font-weight: 600" if "Delinquent" in row["Status"] else ""
-        return [style] * len(row)
-    return df.style.apply(highlight, axis=1)
+    table, not just readable in the Status text.
+    axis=0 with a precomputed row mask, not axis=1 - pandas Styler.apply
+    invokes the callback once per row under axis=1 (pure Python, no
+    vectorization), which measurably adds up on large reports (~350+
+    accounts); computing the boolean mask once and reusing it per column
+    is the same visual result for a fraction of the cost."""
+    style = "color: #E8A33D; font-weight: 600"
+    mask = df["Status"].str.contains("Delinquent")
+    return df.style.apply(lambda _col: [style if m else "" for m in mask], axis=0)
 
 
 _COL_CFG = {
