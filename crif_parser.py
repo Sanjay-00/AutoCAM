@@ -570,6 +570,23 @@ def _extract_max_dpd(block: str) -> int:
     return max(vals) if vals else 0
 
 
+def _has_written_off_signal(block: str) -> bool:
+    """
+    Shared by _is_closed (rules 2 & 4) and _is_written_off - Remarks text
+    naming a write-off, or a non-zero write-off amount field. Factored out
+    so the two regex pairs can't drift apart from each other the way the UI
+    badge's overdue tolerance once drifted from validate_extraction()'s.
+    """
+    rem_m = re.search(r'Remarks\s*:\s*\n\s*([^\n]+)', block)
+    if rem_m and re.search(r'written.?off', rem_m.group(1), re.IGNORECASE):
+        return True
+    wo_m = re.search(
+        r'(?:Total\s+)?Write\s*[- ]?[Oo]ff\s+Amt[:\s]*\n?\s*([\d,]+)',
+        block, re.IGNORECASE,
+    )
+    return bool(wo_m and to_int(wo_m.group(1)) != 0)
+
+
 def _is_closed(block: str) -> bool:
     """
     Rule 1: Closed Date has a valid date.
@@ -584,8 +601,7 @@ def _is_closed(block: str) -> bool:
     if m and re.match(r'\d{2}-\d{2}-\d{4}', m.group(1)):
         return True
 
-    rem_m = re.search(r'Remarks\s*:\s*\n\s*([^\n]+)', block)
-    if rem_m and re.search(r'written.?off', rem_m.group(1), re.IGNORECASE):
+    if _has_written_off_signal(block):
         return True
 
     first_field = re.search(
@@ -596,13 +612,6 @@ def _is_closed(block: str) -> bool:
     if re.search(r'\nClosed\n', header_region):
         return True
 
-    wo_m = re.search(
-        r'(?:Total\s+)?Write\s*[- ]?[Oo]ff\s+Amt[:\s]*\n?\s*([\d,]+)',
-        block, re.IGNORECASE,
-    )
-    if wo_m and to_int(wo_m.group(1)) != 0:
-        return True
-
     return False
 
 
@@ -610,18 +619,11 @@ def _is_written_off(block: str) -> bool:
     """
     Narrower than _is_closed: CRIF Retail has no separate "Written Off"
     status (unlike Commercial) - a written-off account still just shows
-    "Closed" here. This flags the write-off signal specifically (Remarks
-    text, or a non-zero write-off amount) so the Credit Analysis rollup can
-    report it as its own bucket rather than lumping it into generic Closed.
+    "Closed" here. This flags the write-off signal specifically so the
+    Credit Analysis rollup can report it as its own bucket rather than
+    lumping it into generic Closed.
     """
-    rem_m = re.search(r'Remarks\s*:\s*\n\s*([^\n]+)', block)
-    if rem_m and re.search(r'written.?off', rem_m.group(1), re.IGNORECASE):
-        return True
-    wo_m = re.search(
-        r'(?:Total\s+)?Write\s*[- ]?[Oo]ff\s+Amt[:\s]*\n?\s*([\d,]+)',
-        block, re.IGNORECASE,
-    )
-    return bool(wo_m and to_int(wo_m.group(1)) != 0)
+    return _has_written_off_signal(block)
 
 
 # ─────────────────────────────────────────────────────────────────

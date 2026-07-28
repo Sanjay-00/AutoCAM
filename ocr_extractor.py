@@ -2,11 +2,10 @@
 ocr_extractor.py  -  scanned-PDF front-end for AutoCAM.
 
 A scanned CIBIL report carries no extractable text. This module:
-  1. detects that case (is_scanned),
-  2. OCRs every page to text with Tesseract (ocr_document) so the normal
+  1. OCRs every page to text with Tesseract (ocr_document) so the normal
      text parsers can run on the result,
-  3. picks the few pages that feed the Excel table (select_pages), and
-  4. provides a Gemini Vision fallback (vision_extract_accounts) used only when
+  2. picks the few pages that feed the Excel table (select_pages), and
+  3. provides a Gemini Vision fallback (vision_extract_accounts) used only when
      the OCR-fed rule-based parse fails the report's own summary validation.
 
 Tesseract is the primary (free, local) path; Gemini Vision is the accuracy
@@ -71,16 +70,10 @@ _SCAN_TEXT_THRESHOLD = 100  # total stripped chars below this ⇒ treat as scann
 # ─────────────────────────────────────────────────────────────────
 # SCAN DETECTION + OCR
 # ─────────────────────────────────────────────────────────────────
-
-def is_scanned(doc) -> bool:
-    """True when the PDF has effectively no embedded text (image-only scan)."""
-    total = 0
-    for page in doc:
-        total += len(page.get_text().strip())
-        if total >= _SCAN_TEXT_THRESHOLD:
-            return False
-    return True
-
+# Scan detection itself lives in parser._extract() (it already has the joined
+# page text in hand from building `text`, so re-walking the document here
+# would just repeat that page.get_text() pass) - _SCAN_TEXT_THRESHOLD above
+# is imported from there so the two don't drift into disagreeing thresholds.
 
 def _page_image(page, matrix) -> "Image":
     from PIL import Image
@@ -231,11 +224,6 @@ def _ocr_image(pytesseract, img) -> str:
     except Exception:
         pass
     return pytesseract.image_to_string(img, config=_TESS_CONFIG)
-
-
-def _ocr_page(pytesseract, page) -> str:
-    """OCR a PyMuPDF page (render, then delegate). Kept for direct callers."""
-    return _ocr_image(pytesseract, _page_image(page, _OCR_MATRIX))
 
 
 # Per-page OCR is ~95% of runtime and pages are independent, so we OCR them in
@@ -442,14 +430,6 @@ def vision_extract_dpd_from_uri(img_uri: str, accounts: list,
     except Exception:
         pass
     return {}
-
-
-def vision_extract_dpd_per_page(doc, page_idx: int, accounts: list,
-                                 api_key: str, invoke_fn) -> dict:
-    """Convenience wrapper: renders the page then calls vision_extract_dpd_from_uri."""
-    return vision_extract_dpd_from_uri(
-        _img_data_uri(doc[page_idx]), accounts, api_key, invoke_fn
-    )
 
 
 def vision_extract_accounts(doc, page_indices: list, api_key: str,

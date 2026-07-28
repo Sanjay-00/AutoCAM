@@ -302,16 +302,25 @@ if uploaded and run:
             f"Reading coloured payment-history cells with Gemini Vision · {done}/{total} pages"
         )
 
+    _api_key = _load_api_key()
     try:
-        data = parse(uploaded, api_key=_load_api_key(), on_progress=_on_ocr_progress,
+        data = parse(uploaded, api_key=_api_key, on_progress=_on_ocr_progress,
                      on_dpd_progress=_on_dpd_progress if use_vision_dpd else None,
                      enrich_dpd=use_vision_dpd)
     except Exception as e:
         _progress_bar.empty()
         _status_text.empty()
-        st.error(f"Parsing failed: {e}")
+
+        def _redact(s: str) -> str:
+            # Some Google API client errors embed the failing request URL,
+            # which carries the API key as a query param - a raw traceback
+            # shown to the analyst could leak it. Strip the literal key value
+            # wherever it appears rather than trying to pattern-match URLs.
+            return s.replace(_api_key, "[REDACTED]") if _api_key else s
+
+        st.error(f"Parsing failed: {_redact(str(e))}")
         import traceback
-        st.code(traceback.format_exc())
+        st.code(_redact(traceback.format_exc()))
         st.stop()
 
     _progress_bar.empty()

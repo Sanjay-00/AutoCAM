@@ -74,7 +74,7 @@ def _extract(doc, on_progress=None) -> tuple:
     per-page OCR kept for Vision page selection.
     """
     text = _normalize_text("\n".join(page.get_text() for page in doc))
-    if len(text.strip()) >= 100:
+    if len(text.strip()) >= ocr_extractor._SCAN_TEXT_THRESHOLD:
         return text, False, None
 
     combined, page_texts = ocr_extractor.ocr_document(doc, on_progress=on_progress)
@@ -120,7 +120,8 @@ def _detect_provider(text: str) -> str:
 # ─────────────────────────────────────────────────────────────────
 
 def validate_extraction(accounts: list, reported: dict, amount_floor: int = 1000,
-                         overdue_floor: int = 50_000) -> dict:
+                         overdue_floor: int = 50_000,
+                         overdue_scope_all_accounts: bool = False) -> dict:
     """CRIF validation: active count + active balance (+ sanction/overdue on
     CRIF Commercial, where the Borrower Summary prints them) vs the report's
     own summary.
@@ -140,13 +141,35 @@ def validate_extraction(accounts: list, reported: dict, amount_floor: int = 1000
     Overdue is very often reported as Rs.0 (nothing overdue), and 5% of
     zero is zero, which would flag ANY genuinely-small real overdue amount
     (e.g. our Rs.30,000 vs the bureau's Rs.0) as a mismatch even though it's
-    well within the summary table's own Rs.1-lakh rounding precision."""
+    well within the summary table's own Rs.1-lakh rounding precision.
+
+    overdue_scope_all_accounts controls which accounts the Overdue comparison
+    sums over - unlike Total Current Balance (which both providers' own
+    report text explicitly scopes to ACTIVE accounts only), the two
+    providers' Overdue totals are NOT scoped the same way:
+      - CRIF Retail's Account Summary "Total Amount Overdue" includes CLOSED
+        accounts too (a written-off account can still carry a residual
+        overdue balance at closure) - confirmed on real reports where the
+        summary's overdue figure only reconciled once closed accounts were
+        included (e.g. one real report's entire Rs.1,53,857 overdue lived on
+        a single Closed account; an active-only sum read Rs.0 there and
+        failed validation against a real, correctly-extracted figure).
+      - CRIF Commercial's Borrower Summary Overdue figure is active-only
+        (consistent with its Live-Accts-only scoping used throughout this
+        codebase) - confirmed on a real report where switching to an
+        all-accounts sum would have pushed a currently-passing report
+        Rs.3.68L off from the summary (comfortably outside overdue_floor),
+        while the active-only sum landed within Rs.23k of it.
+    Callers must pass the right scope for their provider; getting it backwards
+    turns a real, correct extraction into a false "mismatch" on one provider
+    while masking a real one on the other."""
     issues     = []
     active     = [a for a in accounts if a.get("status") == "Active"]
     count      = len(active)
     balance    = sum(a.get("current_balance") or 0 for a in active)
     sanction   = sum(a.get("sanction_amount") or 0 for a in active)
-    overdue    = sum(a.get("overdue") or 0 for a in active)
+    overdue    = sum(a.get("overdue") or 0
+                     for a in (accounts if overdue_scope_all_accounts else active))
     delinquent = sum(1 for a in active if a.get("delinquent"))
 
     exp_count    = reported.get("account_count")
@@ -331,11 +354,16 @@ def _normalize(accounts: list) -> list:
             acc["date_of_sanction"] = "NA"
         if acc.get("status", "").lower() not in ("active", "closed"):
             acc["status"] = "Active"
+        # written_off: Gemini may omit the key entirely rather than return an
+        # explicit false - without this, Retail's derog rollup would silently
+        # read every LLM-corrected account as "not written off" regardless of
+        # what the report actually says (missing key == falsy == same as a
+        # confident False read, no way to tell them apart downstream).
+        acc["written_off"] = bool(acc.get("written_off"))
     return accounts
 
 
 def _llm_fix_blocks(blocks: list, current: list, api_key: str) -> tuple:
-    import json
     blocks_text = "\n\n__ACCOUNT__\n\n".join(
         f"ACCOUNT {num}:\n{blk[:1800]}" for num, blk in blocks
     )
@@ -345,12 +373,14 @@ def _llm_fix_blocks(blocks: list, current: list, api_key: str) -> tuple:
         f"CURRENT EXTRACTION:\n{json.dumps(current, indent=2)}\n\n"
         f"RAW ACCOUNT BLOCKS:\n{blocks_text[:14000]}\n\n"
         "Return ONLY a valid JSON array. Keys: sr_no, date_of_sanction, sanction_amount, "
-        "current_balance, emi, overdue, entity, type_of_loan, max_dpd, status. "
+        "current_balance, emi, overdue, entity, type_of_loan, max_dpd, status, "
+        "written_off (true only if Remarks says written-off or there's a non-zero "
+        "write-off amount - false otherwise). "
         "Do NOT add or remove accounts."
     )
     try:
         raw   = _llm_invoke(api_key, prompt)
-        fixed = __import__("json").loads(_strip_md(raw))
+        fixed = json.loads(_strip_md(raw))
         if isinstance(fixed, list) and fixed:
             return _normalize(fixed), True
     except Exception:
@@ -363,12 +393,14 @@ def _llm_full(text: str, api_key: str, expected_count) -> tuple:
     prompt = (
         f"Extract ALL loan accounts from this CIBIL credit report. {hint}\n\n"
         "Return ONLY a valid JSON array. Keys: sr_no, date_of_sanction, sanction_amount, "
-        "current_balance, emi, overdue, entity, type_of_loan, max_dpd, status.\n\n"
+        "current_balance, emi, overdue, entity, type_of_loan, max_dpd, status, "
+        "written_off (true only if Remarks says written-off or there's a non-zero "
+        "write-off amount - false otherwise).\n\n"
         f"CIBIL TEXT:\n{text[:28000]}"
     )
     try:
         raw      = _llm_invoke(api_key, prompt)
-        accounts = __import__("json").loads(_strip_md(raw))
+        accounts = json.loads(_strip_md(raw))
         if isinstance(accounts, list) and accounts:
             return _normalize(accounts), True
     except Exception:
@@ -655,6 +687,12 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
             "validation":        validation,
             "provider":          "transunion",
             "tesseract_version": ocr_extractor.tesseract_version() if scanned else None,
+            # Both CRIF paths populate "analysis" (portfolio-level Credit
+            # Analysis section); TU deliberately doesn't - no equivalent
+            # loan-type/asset-class or derog-rollup data is derivable from a
+            # TU Commercial report's own format. Explicit None, not a missing
+            # key, so this reads as intentional rather than an oversight.
+            "analysis":          None,
         }
 
     # ── CRIF Commercial ACE path ──────────────────────────────
@@ -668,14 +706,17 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
     _renumber(accounts)
 
     extraction_method = METHOD_OCR if scanned else METHOD_RULE_BASED
-    validation        = validate_extraction(accounts, reported)
+    # CRIF Retail's Account Summary "Total Amount Overdue" includes Closed
+    # accounts (unlike Total Current Balance, which is active-only) - see
+    # validate_extraction()'s overdue_scope_all_accounts docstring.
+    validation        = validate_extraction(accounts, reported, overdue_scope_all_accounts=True)
 
     # Stage 2: LLM block-fix
     if not validation["valid"] and api_key:
         fixed, ok = _llm_fix_blocks(blocks, accounts, api_key)
         if ok:
             _renumber(fixed)
-            v2 = validate_extraction(fixed, reported)
+            v2 = validate_extraction(fixed, reported, overdue_scope_all_accounts=True)
             if v2["valid"]:
                 accounts          = fixed
                 extraction_method = METHOD_LLM_CORRECTION
@@ -687,7 +728,7 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
                     _renumber(full)
                     accounts          = full
                     extraction_method = METHOD_LLM_FULL
-                    validation        = validate_extraction(accounts, reported)
+                    validation        = validate_extraction(accounts, reported, overdue_scope_all_accounts=True)
 
     return {
         "name":              name,
