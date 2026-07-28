@@ -369,9 +369,19 @@ def _ownership_before(text: str, pos: int) -> str:
 
 
 def _quality(accounts: list, reported: dict) -> float:
-    """Combined relative error of extracted active count/balance vs reported totals. Lower is better."""
+    """Combined relative error of extracted active count/balance vs reported totals. Lower is better.
+    Reported account_count is the bureau's own 'Live Accts' figure, which on
+    some report layouts excludes delinquent accounts (still open, but
+    tracked as their own bucket rather than folded into 'Live') - see
+    validate_extraction()'s matching reconciliation in parser.py. Without
+    this adjustment, a split that wrongly reclassifies a delinquent account
+    as Closed can score BETTER than the correct split (it moves the active
+    count closer to a 'Live' figure that was never meant to include
+    delinquents in the first place) - confirmed picking the wrong of two
+    candidate splits on a real report before this was added."""
     active = [a for a in accounts if a.get("status") == "Active"]
-    ec, eb = len(active), sum(a.get("current_balance") or 0 for a in active)
+    delinquent = sum(1 for a in active if a.get("delinquent"))
+    ec, eb = len(active) - delinquent, sum(a.get("current_balance") or 0 for a in active)
     xc, xb = reported.get("account_count"), reported.get("total_balance")
     err = 0.0
     if xc:
@@ -621,8 +631,19 @@ _CLOSED_KEYWORDS = re.compile(
 
 
 _HTML_STATUS_BADGE = re.compile(
-    r'Info\.?\s*as\s*\n?\s*of\s*:\s*\d{2}-\d{2}-\d{4}\s*\n?\s*(ACTIVE|CLOSED)\b'
+    r'Info\.?\s*as\s*\n?\s*of\s*:\s*\d{2}-\d{2}-\d{4}\s*\n?\s*'
+    r'(ACTIVE|CLOSED|DELINQUENT|WRITTEN OFF|SETTLED)\b'
 )
+# How far into a block to look for the badge above. Bounded deliberately:
+# split_trade_blocks() slices purely on 'Type:' markers, so a trade block's
+# OWN badge (if this layout has one) always sits in the first few lines -
+# never later. Without this bound, a trade block whose tail runs into the
+# NEXT group's 'Loan Terms For:/Info. as of:/<badge>' preamble (this layout
+# doesn't cut trade blocks off at that boundary) would match the NEXT
+# account's badge instead of its own, misclassifying the current account
+# with someone else's status - confirmed on a real report where this
+# stole a 'CLOSED' badge belonging to the following account.
+_STATUS_BADGE_WINDOW = 400
 
 # Some digital-HTML layouts don't render the status badge adjacent to 'Info.
 # as of:' at all (see _HTML_STATUS_BADGE) - instead the bureau's own
@@ -701,9 +722,16 @@ def _resolve_status(block: str, current_balance: int = None) -> str:
         return "Closed"
     if "__STATUS_ACTIVE__" in block:
         return "Active"
-    m = _HTML_STATUS_BADGE.search(block)
+    m = _HTML_STATUS_BADGE.search(block[:_STATUS_BADGE_WINDOW])
     if m:
-        return "Closed" if m.group(1).upper() == "CLOSED" else "Active"
+        word = m.group(1).upper()
+        if word == "WRITTEN OFF":
+            return "Written Off"
+        if word == "SETTLED":
+            return "Settled"
+        if word == "CLOSED":
+            return "Closed"
+        return "Active"  # ACTIVE or DELINQUENT - both still open
     # Rule 1: the Closure Reason VALUE names a terminal status.
     reason = _field(block, r'Closure\s+(?:Reason|Status)')
     if reason:
@@ -773,6 +801,31 @@ def extract_account(ordinal: int, block: str, scanned: bool = False) -> dict:
     status = _resolve_status(block, balance)
     clean  = re.sub(r'__STATUS_(?:ACTIVE|CLOSED)__', '', block)
     sanction = _amount(clean, r'Sanctioned\s+Amount')
+    # Same inline 'Info. as of: <date>\n<badge>' signal _resolve_status() reads
+    # for status (see _HTML_STATUS_BADGE) - also carries the DELINQUENT flag
+    # directly, on layouts where the footer-pill-cluster mechanism
+    # (_status_pill_map) finds nothing at all. Window-bounded for the same
+    # reason as _resolve_status's own lookup - a trade block's tail can run
+    # into the next account's preamble.
+    badge = _HTML_STATUS_BADGE.search(block[:_STATUS_BADGE_WINDOW])
+    inline_delinquent = bool(badge and badge.group(1).upper() == "DELINQUENT")
+    # The report defines the term itself in its own footnote: 'Delinquent
+    # means DPD>15 days or reported as Non-Standard'. That's the account's
+    # CURRENT DPD/Asset Classification (a snapshot as of the report date),
+    # NOT max_dpd below - max_dpd is deliberately the worst reading across the
+    # whole 12-month grid (useful risk history for the analyst), so an
+    # account that had a bad month 8 months ago but has since cured back to
+    # Standard would wrongly stay flagged delinquent forever if this used
+    # max_dpd instead (confirmed on a real report - inflated delinquent count
+    # from 9 to 28 before this was narrowed to _classification_dpd()).
+    # _classification_dpd() returns exactly 0 for 'Standard' and a positive
+    # representative value for every non-Standard bucket, including SMA-0
+    # (which can start at just 1 day overdue under RBI's own staging) - so
+    # '> 0' is the right test for the definition's OR clause ("reported as
+    # Non-Standard"), not '> 15': that numeric threshold is only meaningful
+    # for a literal day-count, and SMA-0 already satisfies the OR on its own.
+    current_dpd = _classification_dpd(clean)
+    classification_delinquent = current_dpd is not None and current_dpd > 0
     return {
         "sr_no":            ordinal,
         "date_of_sanction": _extract_date(clean),
@@ -785,7 +838,11 @@ def extract_account(ordinal: int, block: str, scanned: bool = False) -> dict:
         "type_of_loan":     _extract_loan_type(clean),
         "max_dpd":          _extract_max_dpd(clean),
         "status":           status,
-        "delinquent":       False,   # overridden by the caller from the pill map
+        # Delinquent is an overlay on a still-OPEN account - a Closed/Written
+        # Off/Settled account can carry a non-Standard classification too
+        # (that's often exactly why it's no longer active), but it's already
+        # terminal, not "delinquent" in the sense this flag means elsewhere.
+        "delinquent":       status == "Active" and (inline_delinquent or classification_delinquent),
         "suit_filed":       _extract_suit_filed(clean),
     }
 
@@ -884,8 +941,15 @@ def derog_summary(accounts: list) -> dict:
 def _is_phantom(a: dict) -> bool:
     """Digital PDFs produce orphan fragments (balance-history columns split off
     by a repeated 'Loan Terms For' page header) with no extractable date,
-    sanction amount, or balance — not real accounts."""
-    return a["date_of_sanction"] == "NA" and a["sanction_amount"] == 0 and a["current_balance"] == 0
+    sanction amount, balance, OR loan type - not real accounts. The type_of_loan
+    check matters: a genuine facility that was sanctioned but never drawn down
+    before closing/expiring (e.g. an unused Overdraft) legitimately has a blank
+    Sanctioned Date and zero sanction/balance too, but it still has a real
+    'Type:' label - confirmed on a real report where exactly this kind of
+    account (Overdraft, no Sanctioned Date, 0/0, but a real Closed Date) was
+    being silently dropped by the 3-field-only test."""
+    return (a["date_of_sanction"] == "NA" and a["sanction_amount"] == 0
+            and a["current_balance"] == 0 and a["type_of_loan"] in ("Unknown", "NA"))
 
 
 def _expand_account_blocks(text: str, trade_starts: list, status_map: dict,
@@ -917,7 +981,8 @@ def _expand_account_blocks(text: str, trade_starts: list, status_map: dict,
                 ti = trades_here[0]
                 if ti in status_map:
                     a["status"] = status_map[ti]
-                a["delinquent"] = ti in delinquent_set
+                if ti in delinquent_set:
+                    a["delinquent"] = True
             blocks.append((ordinal, blk))
             accounts.append(a)
             continue
@@ -931,7 +996,8 @@ def _expand_account_blocks(text: str, trade_starts: list, status_map: dict,
                 a["ownership"] = _ownership_before(text, t_start)
             if ti in status_map:
                 a["status"] = status_map[ti]
-            a["delinquent"] = ti in delinquent_set
+            if ti in delinquent_set:
+                a["delinquent"] = True
             blocks.append((ordinal, blk))
             accounts.append(a)
     return blocks, accounts
@@ -988,22 +1054,48 @@ def parse_crif_commercial(text: str, scanned: bool = False) -> tuple:
                 a["ownership"] = _ownership_before(text, start)
             if i in status_map:
                 a["status"] = status_map[i]
-            a["delinquent"] = i in delinquent_set
+            if i in delinquent_set:
+                a["delinquent"] = True
             trade_accounts.append(a)
         trade_accounts = [a for a in trade_accounts if not _is_phantom(a)]
-        if trade_accounts and _quality(trade_accounts, reported) < _quality(accounts, reported):
+        # <= (not strict <): on an exact tie, the trade split is at least as good
+        # by this metric and is immune to a failure mode the group split isn't -
+        # a trade's own trailer fields (Closure Reason/Closed Date/Drawing Power)
+        # printed after a page-break can land just past a 'Loan Terms For:' group
+        # boundary, so a single-trade group's span silently misses them and
+        # falls back to a wrong default status. Confirmed on a real report: the
+        # group split scored an EXACT tie with the trade split yet mislabelled
+        # the report's very first trade Closed (missing its own Rs.35.5L Drawing
+        # Power) where the trade split correctly read it as Active.
+        if trade_accounts and _quality(trade_accounts, reported) <= _quality(accounts, reported):
             blocks, accounts = trade_blocks, trade_accounts
 
     # Override DPD from the authoritative 'Top 5 Non-Standard Facilities' table  -
     # it reports each delinquent facility's DPD cleanly; the per-account payment
     # grid OCRs too poorly to trust. Joined back to accounts on Sanctioned Date.
+    #
+    # Also use it as a delinquent-flag fallback, but ONLY when neither the
+    # footer-pill cluster nor extract_account()'s own inline-badge read (see
+    # _HTML_STATUS_BADGE) found a single delinquent account anywhere in the
+    # document - on some scanned reports the literal word "DELINQUENT" never
+    # survives OCR at all (confirmed on a real report, 0 occurrences), so
+    # those primary signals have no chance of finding it there. But this
+    # table only proves a facility is non-standard AS OF a given date; when
+    # several distinct accounts share a Sanctioned Date (a fleet operator
+    # taking out several identical loans the same day - confirmed on a real
+    # report), joining on date alone flags all of them, not just the one the
+    # table actually meant. Gating on "primary signal found zero" avoids that
+    # overcount whenever the primary signal already works.
     topn = nonstandard_dpd_by_date(text)
     if topn:
+        primary_found_any = any(a.get("delinquent") for a in accounts)
         for a in accounts:
             d = a.get("date_of_sanction")
             if d in topn:
                 # a["max_dpd"] may be None (grid unread) - this table resolves it
                 a["max_dpd"] = max(a["max_dpd"] or 0, topn[d])
+                if not primary_found_any and a["status"] == "Active":
+                    a["delinquent"] = True
 
     _apply_check_cibil_nulls(accounts, scanned)
 

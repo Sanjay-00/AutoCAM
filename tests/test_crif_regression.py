@@ -171,3 +171,164 @@ def test_written_off_and_suit_filed_amounts_are_not_silently_zero(parsed_reports
                 failures.append(f"{os.path.basename(f)} {key}: count={bucket['count']} amount=0")
     if failures:
         pytest.skip(f"zero-amount derog buckets to eyeball (not auto-failed): {failures}")
+
+
+def test_delinquent_only_on_active(parsed_reports):
+    """
+    Delinquent is an overlay on a still-OPEN account. Closed/Written
+    Off/Settled accounts can carry a non-Standard DPD/Asset Classification
+    too (often exactly why they're no longer active), but that's not the
+    same as being 'delinquent' in the sense this flag means everywhere else
+    (a live account CIBIL/CRIF still counts under 'Live'). This caught a
+    real bug: deriving the flag from the account's current classification
+    leaked it onto terminal accounts unless explicitly gated on status.
+    """
+    failures = []
+    for f, r in parsed_reports.items():
+        if isinstance(r, Exception):
+            continue
+        for a in r["accounts"]:
+            if a.get("delinquent") and a.get("status") != "Active":
+                failures.append(f"{os.path.basename(f)} sr_no={a.get('sr_no')} status={a.get('status')}")
+    assert not failures, f"delinquent flag set on a non-Active account: {failures}"
+
+
+def test_delinquent_count_gap_is_reconciled(parsed_reports):
+    """
+    CRIF Commercial's own 'Live Accts' figure deliberately excludes
+    delinquent-but-open accounts, which our extraction correctly counts as
+    Active. When that fully explains an active-count mismatch (extracted
+    active minus delinquent equals the report's own count), validate_
+    extraction() must not flag it as an unexplained error - a report should
+    never show a scary red mismatch for a gap that's fully understood and
+    expected. (This does NOT mean every count mismatch is delinquency - an
+    unexplained gap should still fail; this only checks the reconciled case
+    doesn't regress back to a false failure.)
+    """
+    failures = []
+    for f, r in parsed_reports.items():
+        if isinstance(r, Exception):
+            continue
+        v = r["validation"]
+        exp_c = v.get("expected_count")
+        extracted_c = v.get("extracted_count")
+        delinquent = v.get("delinquent_active_count", 0)
+        if exp_c is None or extracted_c is None:
+            continue
+        if delinquent and extracted_c - delinquent == exp_c and not v["valid"]:
+            failures.append(
+                f"{os.path.basename(f)}: extracted={extracted_c} delinquent={delinquent} "
+                f"expected={exp_c} but valid=False issues={v['issues']}"
+            )
+    assert not failures, f"delinquent-explained count gap wrongly flagged invalid: {failures}"
+
+
+def test_validation_ok_flags_agree_with_issues(parsed_reports):
+    """
+    balance_ok/sanction_ok/overdue_ok exist specifically so app.py's badge
+    never has to re-derive its own pass/fail thresholds (a prior bug: the UI
+    used a different formula than validate_extraction() and could show a
+    tick/cross that disagreed with the actual valid/issues result). This
+    guards the invariant directly: whenever one of these is False, its
+    matching mismatch string must be present in `issues`, and vice versa.
+    """
+    _CHECKS = (
+        ("balance_ok",  "Balance mismatch"),
+        ("sanction_ok", "Sanctioned amount mismatch"),
+        ("overdue_ok",  "Overdue amount mismatch"),
+    )
+    failures = []
+    for f, r in parsed_reports.items():
+        if isinstance(r, Exception):
+            continue
+        v = r["validation"]
+        if "balance_ok" not in v:
+            continue  # TransUnion's simpler validate() doesn't carry these
+        issues_text = " ".join(v.get("issues", []))
+        for flag_key, mismatch_phrase in _CHECKS:
+            ok = v.get(flag_key, True)
+            has_issue = mismatch_phrase in issues_text
+            if ok == has_issue:
+                failures.append(
+                    f"{os.path.basename(f)} {flag_key}={ok} but "
+                    f"{mismatch_phrase!r} present={has_issue}"
+                )
+    assert not failures, f"validation ok-flag disagrees with issues list: {failures}"
+
+
+def test_written_off_is_always_a_bool(parsed_reports):
+    """
+    written_off must never end up None/missing - that reads as a confident
+    "not written off" downstream (Credit Analysis' derog rollup), which is
+    indistinguishable from a real False. This caught a real bug: Gemini's
+    LLM-correction JSON reply didn't carry this key at all, so any account
+    passing through Stage 2/3 correction silently lost the flag.
+    """
+    failures = []
+    for f, r in parsed_reports.items():
+        if isinstance(r, Exception) or r.get("provider") != "crif":
+            continue
+        for a in r["accounts"]:
+            if not isinstance(a.get("written_off"), bool):
+                failures.append(f"{os.path.basename(f)} sr_no={a.get('sr_no')} "
+                                f"written_off={a.get('written_off')!r}")
+    assert not failures, f"written_off not a bool: {failures}"
+
+
+def test_retail_credit_profile_summary_matches_active_accounts(parsed_reports):
+    """
+    CRIF Retail's loan-type distribution is derived from the extracted
+    accounts list, not re-parsed from a report table - so it must exactly
+    reconcile back to the active accounts it was built from (count and
+    outstanding balance), the same self-consistency guarantee Commercial's
+    asset-class distribution already has.
+    """
+    failures = []
+    for f, r in parsed_reports.items():
+        if isinstance(r, Exception) or r.get("provider") != "crif":
+            continue
+        analysis = r.get("analysis") or {}
+        cps = analysis.get("credit_profile_summary") or []
+        active = [a for a in r["accounts"] if a.get("status") == "Active"]
+        cps_count = sum(b["count"] for b in cps)
+        cps_outstanding = sum(b["outstanding"] for b in cps)
+        exp_count = len(active)
+        exp_outstanding = sum(a.get("current_balance") or 0 for a in active)
+        if cps_count != exp_count or cps_outstanding != exp_outstanding:
+            failures.append(
+                f"{os.path.basename(f)}: cps count/outstanding="
+                f"{cps_count}/{cps_outstanding} vs active accounts="
+                f"{exp_count}/{exp_outstanding}"
+            )
+    assert not failures, f"loan-type distribution doesn't reconcile: {failures}"
+
+
+def test_retail_overdue_validation_includes_closed_accounts(parsed_reports):
+    """
+    CRIF Retail's Account Summary "Total Amount Overdue" is scoped over ALL
+    accounts (including Closed - a written-off account can still carry a
+    residual overdue balance at closure), unlike Total Current Balance which
+    is active-only. Confirmed on a real report where the entire reported
+    overdue figure lived on a single Closed account - an active-only sum
+    read Rs.0 there and failed validation against a correctly-extracted
+    figure. This is the opposite scope from CRIF Commercial (active-only,
+    consistent with its Live-Accts-only convention elsewhere) - getting this
+    backwards for either provider silently breaks real, correct extractions.
+    """
+    failures = []
+    for f, r in parsed_reports.items():
+        if isinstance(r, Exception) or r.get("provider") != "crif":
+            continue
+        v = r["validation"]
+        exp_o = v.get("expected_overdue")
+        if exp_o is None:
+            continue
+        all_sum    = sum(a.get("overdue") or 0 for a in r["accounts"])
+        active_sum = sum(a.get("overdue") or 0 for a in r["accounts"]
+                         if a.get("status") == "Active")
+        if all_sum != active_sum and v.get("extracted_overdue") != all_sum:
+            failures.append(
+                f"{os.path.basename(f)}: validation used {v.get('extracted_overdue')}, "
+                f"expected all-accounts sum {all_sum} (active-only would be {active_sum})"
+            )
+    assert not failures, f"Retail overdue validation not scoped to all accounts: {failures}"
