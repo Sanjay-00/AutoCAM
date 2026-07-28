@@ -12,7 +12,6 @@ Tesseract is the primary (free, local) path; Gemini Vision is the accuracy
 safety net. See parser.parse() for the orchestration.
 """
 
-import io
 import os
 import json
 
@@ -77,8 +76,15 @@ _SCAN_TEXT_THRESHOLD = 100  # total stripped chars below this ⇒ treat as scann
 
 def _page_image(page, matrix) -> "Image":
     from PIL import Image
+    # Build the PIL Image straight from the pixmap's raw sample buffer, not via
+    # a PNG encode/decode round-trip (tobytes("png") + Image.open) - the PNG
+    # compression step alone was ~13x slower than frombytes for the same
+    # pixels (confirmed byte-identical output), and this runs on the single
+    # rendering thread (PyMuPDF isn't thread-safe) ahead of every OCR/Vision
+    # page, so it's squarely on the critical path.
     pix = page.get_pixmap(matrix=matrix)
-    return Image.open(io.BytesIO(pix.tobytes("png")))
+    mode = "RGBA" if pix.alpha else "RGB"
+    return Image.frombytes(mode, (pix.width, pix.height), pix.samples)
 
 
 # ── Geometry-aware reconstruction ─────────────────────────────────
@@ -155,9 +161,13 @@ def _detect_status_strips(img) -> list:
         import numpy as np
     except ImportError:
         return []
-    arr = np.asarray(img.convert("RGB")).astype(int)
-    H, W, _ = arr.shape
-    left = arr[:, : int(W * 0.12), :]                 # only the far-left margin
+    # Crop to the left margin BEFORE converting to RGB/numpy, not after - only
+    # ~12% of the page is ever read, so converting the other 88% just to slice
+    # it away is pure wasted work (page images run a few thousand px tall,
+    # this is a real cost across every page of a scanned report).
+    W, page_H = img.size
+    left = np.asarray(img.crop((0, 0, int(W * 0.12), page_H)).convert("RGB")).astype(int)
+    H = left.shape[0]
     R, G, B = left[:, :, 0], left[:, :, 1], left[:, :, 2]
     colored  = (left.max(axis=2) - left.min(axis=2)) > 25   # not near-gray
     redish   = colored & (R > G + 15) & (R > B + 15)
