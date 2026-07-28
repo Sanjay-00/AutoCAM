@@ -330,12 +330,29 @@ def split_account_blocks(text: str) -> list:
 # accounts as "phantom". Each trade entry's own 'Type:' field line precedes its
 # financial fields and does not repeat elsewhere, so it anchors 1:1 with the
 # report's true account count in that layout.
-_TRADE_MARKER = re.compile(r'\bType:\s*\n')
+#
+# Digital text prints the label alone on its own line ('Type:\n<value on next
+# line>'); OCR's geometry-reconstructed text (_reconstruct_rows in
+# ocr_extractor.py) joins a row's label and value with a single space instead
+# ('Type: <value> ...') since it's rebuilding visual rows, not the PDF's own
+# line breaks. Digital's '\s*\n' requirement never matches that shape, which
+# meant split_trade_blocks() - and therefore the trade-vs-group quality
+# comparison in parse_crif_commercial() below - silently did nothing on every
+# scanned report (confirmed: 0 matches on real OCR'd text), leaving scanned
+# reports with no protection against the group-boundary/page-break bug that
+# comparison exists to catch. Two separate patterns rather than one loosened
+# one - checked both against real OCR'd text for false positives first
+# ('Type of Relationship', a guarantor-table 'Type' column with no colon):
+# neither has a literal colon directly after 'Type', so requiring one stays
+# safe on both text shapes without over-matching.
+_TRADE_MARKER         = re.compile(r'\bType:\s*\n')
+_TRADE_MARKER_SCANNED = re.compile(r'\bType\s*:\s+\S')
 
 
-def split_trade_blocks(text: str) -> list:
+def split_trade_blocks(text: str, scanned: bool = False) -> list:
     """Returns list of (ordinal, block_text), one per 'Type:' occurrence."""
-    starts = [m.start() for m in _TRADE_MARKER.finditer(text)]
+    marker = _TRADE_MARKER_SCANNED if scanned else _TRADE_MARKER
+    starts = [m.start() for m in marker.finditer(text)]
     if not starts:
         return []
     blocks = []
@@ -785,7 +802,14 @@ def extract_account(ordinal: int, block: str, scanned: bool = False) -> dict:
     # genuine zero reliably (no OCR ambiguity), so this only applies when
     # the text came through OCR - on digital text a substituted balance would
     # overstate a correctly-read zero-utilisation facility.
-    if scanned and balance == 0:
+    # _amount() alone can't tell "field genuinely blank/unreadable" apart from
+    # "field literally reads 0" (both return int 0), so gate on the raw field
+    # text too - a confident "Current Balance: 0" (fully paid down but not yet
+    # formally closed - a real, common state, not an OCR failure) must NOT be
+    # overwritten by Drawing Power. Confirmed on a real report where this
+    # exact substitution inflated two accounts' balance by their full
+    # Drawing Power and broke the report's own balance reconciliation.
+    if scanned and balance == 0 and _field(block, r'Current\s+Balance').strip() != "0":
         dp = _amount(block, r'Drawing\s+Power')
         if dp > 0:
             balance = dp
@@ -801,6 +825,19 @@ def extract_account(ordinal: int, block: str, scanned: bool = False) -> dict:
     status = _resolve_status(block, balance)
     clean  = re.sub(r'__STATUS_(?:ACTIVE|CLOSED)__', '', block)
     sanction = _amount(clean, r'Sanctioned\s+Amount')
+    # Same OCR-unreadable-field fallback as Current Balance above, but no
+    # confident-zero guard needed here: unlike a balance, a loan is never
+    # genuinely sanctioned for Rs.0 (see _apply_check_cibil_nulls's own
+    # domain rule below), so ANY 0 read here - blank or a literal OCR "0" -
+    # is untrustworthy, and Drawing Power is the same reliable proxy value.
+    # Confirmed on a real report where three accounts' Sanctioned Amount OCR'd
+    # blank while Drawing Power (identical value on every account where both
+    # were legible) read cleanly - recovering it here fixed a real, evidenced
+    # sanction-total shortfall instead of leaving it silently under-summed.
+    if scanned and sanction == 0:
+        dp = _amount(clean, r'Drawing\s+Power')
+        if dp > 0:
+            sanction = dp
     # Same inline 'Info. as of: <date>\n<badge>' signal _resolve_status() reads
     # for status (see _HTML_STATUS_BADGE) - also carries the DELINQUENT flag
     # directly, on layouts where the footer-pill-cluster mechanism
@@ -1003,13 +1040,21 @@ def _expand_account_blocks(text: str, trade_starts: list, status_map: dict,
     return blocks, accounts
 
 
-def _apply_check_cibil_nulls(accounts: list, scanned: bool) -> None:
+def _apply_check_cibil_nulls(accounts: list, blocks: list, scanned: bool) -> None:
     """
-    On scanned (OCR'd) reports, a literal 0 for Sanctioned Amount or Current
-    Balance on an Active account is usually an unread field (0 is never a
-    real sanctioned amount, and OCR often can't read Current Balance at all)
-    - flip it to None so the app shows "Check CIBIL" instead of a fabricated
-    0. On digital text there's no such OCR ambiguity: a literal 0 there is a
+    On scanned (OCR'd) reports, a literal 0 for Sanctioned Amount on an Active
+    account is essentially always an unread field (a loan is never genuinely
+    sanctioned for Rs.0) - flip it to None so the app shows "Check CIBIL"
+    instead of a fabricated 0.
+
+    Current Balance is different: unlike Sanctioned Amount, a real Rs.0
+    balance is common and legitimate (an account paid down to zero but not
+    yet formally closed - the exact case extract_account()'s Drawing-Power
+    fallback above was found clobbering). So only null out Current Balance
+    when the account's own block text doesn't actually show a confident "0"
+    - i.e. genuinely blank/unreadable, not a real zero we already trust.
+
+    On digital text there's no such OCR ambiguity: a literal 0 there is a
     confident, genuine read (e.g. an undrawn revolving facility), so it's
     left as-is. Runs after every status override (pill map, trade-vs-group
     quality pick) so it keys off each account's FINAL status, not the
@@ -1017,13 +1062,16 @@ def _apply_check_cibil_nulls(accounts: list, scanned: bool) -> None:
     """
     if not scanned:
         return
+    block_by_sr = dict(blocks)
     for a in accounts:
         if a["status"] != "Active":
             continue
         if a["sanction_amount"] == 0:
             a["sanction_amount"] = None
         if a["current_balance"] == 0:
-            a["current_balance"] = None
+            blk = block_by_sr.get(a["sr_no"], "")
+            if _field(blk, r'Current\s+Balance').strip() != "0":
+                a["current_balance"] = None
 
 
 def parse_crif_commercial(text: str, scanned: bool = False) -> tuple:
@@ -1032,7 +1080,8 @@ def parse_crif_commercial(text: str, scanned: bool = False) -> tuple:
     score    = extract_score(text)
     reported = extract_reported_totals(text)
 
-    trade_starts = [m.start() for m in _TRADE_MARKER.finditer(text)]
+    _marker = _TRADE_MARKER_SCANNED if scanned else _TRADE_MARKER
+    trade_starts = [m.start() for m in _marker.finditer(text)]
     status_map, delinquent_set = _status_pill_map(text, trade_starts)
 
     blocks, accounts = _expand_account_blocks(text, trade_starts, status_map,
@@ -1045,7 +1094,7 @@ def parse_crif_commercial(text: str, scanned: bool = False) -> tuple:
     # the pure 'Type:'-anchored trade split and keep whichever is closer to
     # the report's own totals, the same way parser.py picks between OCR and
     # Vision extraction.
-    trade_blocks = split_trade_blocks(text)
+    trade_blocks = split_trade_blocks(text, scanned)
     if trade_blocks:
         trade_accounts = []
         for i, ((num, blk), start) in enumerate(zip(trade_blocks, trade_starts)):
@@ -1097,7 +1146,7 @@ def parse_crif_commercial(text: str, scanned: bool = False) -> tuple:
                 if not primary_found_any and a["status"] == "Active":
                     a["delinquent"] = True
 
-    _apply_check_cibil_nulls(accounts, scanned)
+    _apply_check_cibil_nulls(accounts, blocks, scanned)
 
     accounts.sort(key=lambda x: x["sr_no"])
 
