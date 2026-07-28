@@ -527,7 +527,7 @@ def _extract_loan_type(block: str) -> str:
 # SMA-1: 31-60, SMA-2: 61-90, Substandard/NPA: 90+) - which is also what the
 # Excel gradient's colour bands (excel_generator._DPD_BANDS) were built
 # around, so a classification-derived value still lands in the right colour.
-_CLASSIFICATION_WORD = r'STANDARD|SPECIAL\s+MENTION\s+ACCOUNT\s*-?\s*\n?\s*(\d)?|SUB\s*-?\s*STANDARD|DOUBTFUL|LOSS'
+_CLASSIFICATION_WORD = r'STANDARD|SPECIAL\s+MENTION\s+(?:ACCOUNT\s*)?-?\s*\n?\s*(\d)?|SUB\s*-?\s*STANDARD|DOUBTFUL|LOSS'
 _CLASSIFICATION_RE = re.compile(
     r'DPD\s*/\s*Asset\s*\n?\s*Classification\s*:\s*\n?\s*(' + _CLASSIFICATION_WORD + r')',
     re.IGNORECASE,
