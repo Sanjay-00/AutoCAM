@@ -253,7 +253,7 @@ uploaded = st.file_uploader("Upload CRIF or TransUnion CIBIL PDF or HTML", type=
 
 col_btn, col_dpd, _ = st.columns([1, 2, 2])
 with col_btn:
-    run = st.button("🔍  Extract Data", type="primary", use_container_width=True, disabled=not uploaded)
+    run = st.button("🔍  Extract Data", type="primary", width="stretch", disabled=not uploaded)
 with col_dpd:
     use_vision_dpd = st.checkbox(
         "Use Gemini Vision fallback",
@@ -471,12 +471,12 @@ tab_all, tab_active, tab_closed = st.tabs([
 ])
 
 with tab_all:
-    st.dataframe(_style_delinquent(_to_df(accounts)), column_config=_COL_CFG, use_container_width=True, hide_index=True)
+    st.dataframe(_style_delinquent(_to_df(accounts)), column_config=_COL_CFG, width="stretch", hide_index=True)
 with tab_active:
     if active:
         if delinquent:
             st.caption(f"🟠 **{len(delinquent)}** of these are delinquent-but-open (highlighted below).")
-        st.dataframe(_style_delinquent(_to_df(active)), column_config=_COL_CFG, use_container_width=True, hide_index=True)
+        st.dataframe(_style_delinquent(_to_df(active)), column_config=_COL_CFG, width="stretch", hide_index=True)
     else:
         st.info("No active accounts.")
 with tab_closed:
@@ -484,7 +484,7 @@ with tab_closed:
         breakdown = Counter(a["status"] for a in closed)
         if len(breakdown) > 1:
             st.caption("  ·  ".join(f"**{v}** {k}" for k, v in breakdown.items()))
-        st.dataframe(_to_df(closed), column_config=_COL_CFG, use_container_width=True, hide_index=True)
+        st.dataframe(_to_df(closed), column_config=_COL_CFG, width="stretch", hide_index=True)
     else:
         st.info("No closed accounts.")
 
@@ -541,7 +541,7 @@ if analysis:
                     "Accounts":    b["count"],
                     "Outstanding": _fmt_inr(b["outstanding"]),
                 } for b in cps]),
-                hide_index=True, use_container_width=True,
+                hide_index=True, width="stretch",
             )
         else:
             st.caption("No active accounts to classify.")
@@ -571,7 +571,7 @@ if analysis:
                 pd.DataFrame([{
                     "Category": r[0], "Accounts": r[1], "Amount": _fmt_inr(r[2]),
                 } for r in derog_rows]),
-                hide_index=True, use_container_width=True,
+                hide_index=True, width="stretch",
             )
         else:
             st.caption("No written-off, settled, suit-filed, or delinquent accounts.")
@@ -594,6 +594,6 @@ with dl_col:
         data=excel_bytes,
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
         type="primary",
     )
