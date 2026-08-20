@@ -14,6 +14,7 @@ safety net. See parser.parse() for the orchestration.
 
 import os
 import json
+import re
 
 import fitz  # PyMuPDF
 
@@ -102,6 +103,24 @@ def _page_image(page, matrix) -> "Image":
 _ROW_TOL_FRAC = 0.6   # row band tolerance as a fraction of the median word height
 _MIN_CONF     = 30    # drop very-low-confidence words (mostly noise glyphs)
 
+# Tesseract's word segmenter merges several adjacent Payment-History grid cells
+# into one run-on token when they share a colored (non-white) highlight
+# background - e.g. four real cells "023/XXX" "023/XXX" "023/XXX" "023/XXX"
+# come back as one token "023/KXX_|_023/KXX_|_023/KXX_|_023/KXX_". That merged
+# token scores 0-4% confidence (it isn't a real word to Tesseract's language
+# model) and _MIN_CONF then silently drops it - even though the digits inside
+# it are perfectly legible; confirmed on a real report where every DPD grid
+# cell shaded orange (i.e. every DPD > 30, exactly the delinquent accounts a
+# credit analyst most needs to see) came back completely missing from the
+# reconstructed text, while the neighbouring low/zero-DPD white cells read
+# fine. A plain (non-confidence-filtered) OCR pass on the same crop recovers
+# the digits, so the loss is this confidence gate, not the underlying image.
+# Rescue low-confidence tokens that still look like a DPD cell (or a run of
+# them) - the "\d{1,3}/[A-Za-z]{2,3}" shape is specific enough that random
+# noise essentially never produces it, so this doesn't reopen the gate to
+# the noise _MIN_CONF exists to keep out.
+_DPD_CELL_HINT = re.compile(r'\d{1,3}\s*/\s*[A-Za-z]{2,3}')
+
 # CRIF Commercial ACE prints each account's live/closed status as a vertical
 # colored strip in the left margin: "ACTIVE" in red, "CLOSED" in green. This is
 # the bureau's own per-account label  -  far more reliable than guessing from the
@@ -123,7 +142,7 @@ def _reconstruct_rows(data: dict) -> list:
             conf = float(data["conf"][i])
         except (ValueError, TypeError):
             conf = -1
-        if conf < _MIN_CONF:
+        if conf < _MIN_CONF and not _DPD_CELL_HINT.search(txt):
             continue
         words.append((data["top"][i], data["left"][i], data["height"][i], txt))
     if not words:
