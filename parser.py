@@ -18,6 +18,7 @@ from crif_parser import (
     parse_crif, extract_reported_totals, split_account_blocks,
     credit_profile_summary as crif_credit_profile_summary,
     derog_summary as crif_derog_summary,
+    extract_borrower_identity,
 )
 from crif_parser import _is_closed, _extract_balance, _extract_entity
 from crif_commercial_parser import parse_crif_commercial, credit_profile_summary, derog_summary
@@ -177,6 +178,48 @@ def validate_extraction(accounts: list, reported: dict, amount_floor: int = 1000
     exp_sanction = reported.get("total_sanction")
     exp_overdue  = reported.get("total_overdue")
 
+    # An account whose loan type came back "Unknown" is a proxy for a block
+    # whose header row OCR'd too badly for even the fuzzy vocabulary match in
+    # _extract_loan_type to recover - confirmed on a real scanned report
+    # where two accounts' header rows OCR'd into unrelated garbage words
+    # (e.g. "COMMERCIAL VEHICLE cist" / "LOAN 08 pe 3105-2005") even though
+    # every other field in the same block, and every neighbouring account's
+    # header on the same page, read perfectly cleanly - a narrow, row-level
+    # OCR failure rather than a page-wide quality problem. Balance/count can
+    # still happen to reconcile against the report's own summary in that
+    # case (or there may be no summary to check against at all, as here),
+    # so this needs its own signal - it's the only way this class of error
+    # ever surfaces, and it's what lets the Stage 2/3 LLM correction cascade
+    # (which reads from the same raw block text and can usually reconstruct
+    # the type from the surviving fragments) actually get a chance to run.
+    unknown_type = [a for a in accounts if (a.get("type_of_loan") or "Unknown") == "Unknown"]
+    if unknown_type:
+        issues.append(
+            f"{len(unknown_type)} account(s) have an unrecognized loan type "
+            "- likely OCR corruption in that account's header row. Please "
+            "check manually."
+        )
+
+    # An account can't be genuinely overdue by a real amount while also
+    # having 0 days past due - that's a logical contradiction, not a real
+    # report state, so it's a ground-truth-free signal that the Payment
+    # History grid's OCR lost the actual DPD (confirmed on a real scanned
+    # report where several accounts' DPD grid cells were shaded - and
+    # therefore harder for Tesseract to segment cleanly - and came back
+    # reading as 0 instead of their real value, e.g. 45 or 83, while the
+    # separately-extracted Overdue Amt field stayed correct throughout).
+    # None (grid genuinely unread, CRIF Commercial only) is excluded - that's
+    # already surfaced elsewhere ("Check CIBIL"), this is specifically about
+    # a *wrong* 0, not a missing one.
+    dpd_contradiction = [a for a in accounts
+                          if (a.get("overdue") or 0) > 1000 and a.get("max_dpd") == 0]
+    if dpd_contradiction:
+        issues.append(
+            f"{len(dpd_contradiction)} account(s) show a real overdue amount "
+            "but 0 days past due - likely OCR loss in that account's Payment "
+            "History grid. Please check manually."
+        )
+
     # Per-field pass/fail, computed with the exact same thresholds used below
     # to raise issues - callers (app.py's validation badge) must read these
     # rather than re-deriving their own tolerance, so the UI's tick/cross can
@@ -247,6 +290,8 @@ def validate_extraction(accounts: list, reported: dict, amount_floor: int = 1000
         "balance_ok":          balance_ok,
         "sanction_ok":         sanction_ok,
         "overdue_ok":          overdue_ok,
+        "unknown_type_count":  len(unknown_type),
+        "dpd_contradiction_count": len(dpd_contradiction),
     }
 
 
@@ -634,6 +679,11 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
         "dpd_vision_pages":       dpd_vision_summary["pages_sent"],
         "dpd_vision_checked":     dpd_vision_summary["accounts_checked"],
         "dpd_vision_patched":     dpd_vision_summary["accounts_patched"],
+        # CRIF Commercial reports an entity, not an individual - the header
+        # doesn't carry a personal PAN/DOB/phone in the format
+        # extract_borrower_identity() looks for, so this comes back all
+        # None rather than a wrong guess.
+        "identity":               extract_borrower_identity(text),
     }
 
 
@@ -693,6 +743,11 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
             # TU Commercial report's own format. Explicit None, not a missing
             # key, so this reads as intentional rather than an oversight.
             "analysis":          None,
+            # TU Commercial's header layout doesn't match the CRIF PAN/DOB/
+            # phone label formats extract_borrower_identity() looks for; all
+            # three come back None rather than a wrong guess against an
+            # unverified format.
+            "identity":          extract_borrower_identity(text),
         }
 
     # ── CRIF Commercial ACE path ──────────────────────────────
@@ -742,6 +797,7 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
             "credit_profile_summary": crif_credit_profile_summary(accounts),
             "derog_summary":          crif_derog_summary(accounts),
         },
+        "identity": extract_borrower_identity(text),
     }
 
 
