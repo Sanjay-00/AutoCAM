@@ -42,6 +42,34 @@ def extract_name(text: str) -> str:
     return " ".join(words)
 
 
+# PAN must carry the report's own "[PAN]" tag (e.g. "AITPH1156K [PAN]" in
+# the Inquiry Input Information ID(s) field) - matched against that specific
+# labelled format only, never a bare PAN-shaped token found anywhere else in
+# the report, which could just as easily belong to a co-applicant listed in
+# a later table. DOB and phone are similarly anchored to their one specific
+# header field, not the later "DOB Variations" / "Phone Variations" tables
+# (multiple candidate values, no way to know which is current).
+_PAN_RE = re.compile(r'([A-Z]{5}\d{4}[A-Z])\s*\[PAN\]')
+_DOB_RE = re.compile(r'DOB/Age:\s*(\d{2}-\d{2}-\d{4})')
+_PHONE_RE = re.compile(r'Phone\s*Numbers?:\s*(\+?\d[\d\s]{7,14}\d)')
+
+
+def extract_borrower_identity(text: str) -> dict:
+    """Best-effort PAN, date of birth, and primary phone number from the
+    Inquiry Input Information header block. Each is matched against its own
+    specific, labelled format only - a miss returns None rather than a
+    wrong value, same never-guess contract as extract_name.
+    """
+    pan_match = _PAN_RE.search(text)
+    dob_match = _DOB_RE.search(text)
+    phone_match = _PHONE_RE.search(text)
+    return {
+        "pan": pan_match.group(1) if pan_match else None,
+        "dob": dob_match.group(1) if dob_match else None,
+        "phone": phone_match.group(1).replace(" ", "") if phone_match else None,
+    }
+
+
 def extract_score(text: str):
     # Primary: score digit appears right after "300-900" on the same line
     m = re.search(r'300-900\s*\n?\s*(\d{3})\b', text)
@@ -202,6 +230,18 @@ _BLOCK_FIELD  = re.compile(
 # real account block's header.
 _BARE_INFO_HEADER = re.compile(r'\bInformation\s*\n(?=[^\n]*ype\s*:)', re.MULTILINE | re.IGNORECASE)
 
+# OCR can also truncate "Information" itself, losing the trailing "-tion"
+# ("Account Informati", "Account Informa") rather than corrupting "Account".
+# Confirmed on a real scanned report where this exact truncation, combined
+# with a mangled "Account"/"ccount"/"unt" prefix, silently dropped 16 of 62
+# real accounts (the header matched none of the patterns above, so the whole
+# account's fields got appended onto the tail of the previous block instead
+# of starting a new one). The line is short (just the fragment) and unique to
+# this header - "informa" doesn't otherwise appear on its own line anywhere
+# else in a real report - so match a whole short line ending in "informa"
+# (optionally +"ti", optionally +":") with nothing after it but the newline.
+_AI_HEADER_TRUNCATED = re.compile(r'^.{0,12}informa(?:ti)?:?[ \t]*\n', re.MULTILINE | re.IGNORECASE)
+
 # Pass 3: page-break recovery where the ENTIRE "Account Information" header
 # text (not just the number, unlike Pass 2) is swallowed by the browser's
 # print footer/header, leaving a bare number line directly followed by
@@ -257,7 +297,7 @@ def split_account_blocks(text: str) -> list:
     # would then wrongly treat them as one account reprinted across a page
     # break, silently dropping a real account.
     pass2_positions = []
-    for pat in (_AI_HEADER, _BARE_INFO_HEADER):
+    for pat in (_AI_HEADER, _BARE_INFO_HEADER, _AI_HEADER_TRUNCATED):
         for m in pat.finditer(text):
             pos = m.start()
             if any(abs(pos - fp) < 50 for fp in found_positions):
@@ -295,12 +335,19 @@ def split_account_blocks(text: str) -> list:
     # same account twice. CRIF account numbers are unique per report, so any
     # adjacent duplicate is this continuation pattern, not a coincidence -
     # drop the second entry and let the merged block span both halves.
-    merged = [deduped[0]]
-    for pos, num in deduped[1:]:
-        if num == merged[-1][1]:
-            continue
-        merged.append((pos, num))
-    deduped = merged
+    # Guard: a report where none of the header patterns above matched
+    # anything (a genuinely account-free report, or a format variant this
+    # parser doesn't recognize) leaves deduped empty. Nothing to merge in
+    # that case; the caller (split_account_blocks) already returns []
+    # correctly for an empty deduped list further down, this just avoids
+    # indexing into it here first.
+    if deduped:
+        merged = [deduped[0]]
+        for pos, num in deduped[1:]:
+            if num == merged[-1][1]:
+                continue
+            merged.append((pos, num))
+        deduped = merged
 
     blocks = []
     for i, (start_pos, acct_num) in enumerate(deduped):
@@ -408,11 +455,15 @@ def _extract_overdue(block: str) -> int:
 
 
 def _extract_emi(block: str) -> int:
+    # Usually "6,758/Monthly" (amount/frequency), but some bureau-supplied
+    # rows omit the frequency word entirely and print just "6,758" - the
+    # amount is still real and still due, so it must not be dropped for
+    # lack of a trailing "/frequency" to match against.
     val = _next_line_value(block, "InstlAmt/Freq:")
-    m = re.match(r'([\d,]+)/', val)
+    m = re.match(r'([\d,]+)', val)
     if m:
         return to_int(m.group(1))
-    m = re.search(r'InstlAmt/Freq[:\s]*([\d,]+)/', block)
+    m = re.search(r'InstlAmt/Freq[:\s]*([\d,]+)', block)
     return to_int(m.group(1)) if m else 0
 
 
