@@ -198,16 +198,21 @@ def _parse_summary_row_full(row: str, lender_inline: bool) -> dict:
         total = None
 
     # Sanctioned Amt precedes the '(x%)' token; Outstanding/Overdue/PAR(90+)
-    # follow it in that order (all in Crores in the source text).
+    # follow it in that order (all in Crores in the source text). Outstanding
+    # onward are optional - a zero-exposure borrower's row collapses to a
+    # single "0.0 (0%)" cell with nothing after it (confirmed on a real nil
+    # report), and requiring Outstanding to be present made the WHOLE match
+    # fail, nulling out even the confidently-read Sanctioned Amt.
     amt_m = re.search(
-        r'([\d]+\.?\d*)\s*\(\s*[\d.]+\s*%\s*\)\s*([\d]+\.?\d*)'
-        r'(?:\s+([\d]+\.?\d*))?(?:\s+([\d]+\.?\d*))?',
+        r'([\d]+\.?\d*)\s*\(\s*[\d.]+\s*%\s*\)'
+        r'(?:\s+([\d]+\.?\d*))?(?:\s+([\d]+\.?\d*))?(?:\s+([\d]+\.?\d*))?',
         row,
     )
     sanctioned = outstanding = overdue = par_90plus = None
     if amt_m:
         sanctioned  = int(round(float(amt_m.group(1)) * _CRORE))
-        outstanding = int(round(float(amt_m.group(2)) * _CRORE))
+        if amt_m.group(2):
+            outstanding = int(round(float(amt_m.group(2)) * _CRORE))
         if amt_m.group(3):
             overdue = int(round(float(amt_m.group(3)) * _CRORE))
         if amt_m.group(4):
