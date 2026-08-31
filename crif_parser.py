@@ -180,6 +180,58 @@ def extract_reported_totals(text: str) -> dict:
                         totals["total_overdue"]  = to_int(amounts[5])
                     break
 
+    # Layout where the summary's 12 header labels print as their own block
+    # (not adjoining their values, the shape every fallback above assumes)
+    # and the final header word can itself be print/OCR-truncated (confirmed
+    # on a real report: "Total Amou\nOverdue\n" for "Total Amount Overdue"),
+    # so even the anchor-token search at the top of this function can't
+    # recognise it and the account-count validation check silently never
+    # runs. The values still follow, one bare number per line, right after
+    # that last header fragment - anchor on the LAST bare "Overdue" line in
+    # the section (the final of the 12 headers is always "...Overdue"; an
+    # earlier "Overdue Accounts" header line, if also split, still carries
+    # the word "Accounts" too and won't match this bare-word-only pattern)
+    # and read the next 12 standalone-number lines as the 12 columns in order.
+    if totals["account_count"] is None:
+        group_m   = re.search(r'Group\s+Account\s+Summary', section, re.IGNORECASE)
+        main_part = section[: group_m.start()] if group_m else section
+        last_overdue_line = None
+        for hm in re.finditer(r'(?m)^[^\S\n]*Overdue[^\S\n]*$', main_part, re.IGNORECASE):
+            last_overdue_line = hm
+        if last_overdue_line:
+            vals = []
+            for line in main_part[last_overdue_line.end():].split('\n'):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if re.fullmatch(r'[\d,]+', stripped):
+                    vals.append(to_int(stripped))
+                    if len(vals) >= 12:
+                        break
+                elif vals:
+                    break
+            if len(vals) >= 12:
+                totals["account_count"]  = vals[1]
+                totals["total_balance"]  = vals[6]
+                totals["total_sanction"] = vals[9]
+                totals["total_overdue"]  = vals[11]
+
+    # Total Current Balance recovery when the row's own small integer columns
+    # (Number/Active/Overdue Accounts) failed the secured+unsecured==total
+    # sanity check above - that check catches OCR leading-digit drops (12->2)
+    # in the COUNT columns, but the amount columns are unaffected by it and
+    # can still be trusted. CRIF wraps a long "Total Current Balance" value
+    # onto its own line when the row is wide, immediately followed by the
+    # rest of the row's numbers - that adjacency is what "extracted_balance
+    # over extracted_count" (this project's authoritative validation signal)
+    # needs, even when the count half of the row is unreadable.
+    if totals["total_balance"] is None:
+        group_m   = re.search(r'Group\s+Account\s+Summary', section, re.IGNORECASE)
+        main_part = section[: group_m.start()] if group_m else section
+        m = re.search(r'\n\s*([\d,]{7,})\s*\n[^\n]*[\d,]{6,}', main_part)
+        if m:
+            totals["total_balance"] = to_int(m.group(1))
+
     return totals
 
 
@@ -451,7 +503,25 @@ def _extract_overdue(block: str) -> int:
     if re.match(r'[\d,]+', val):
         return to_int(val.split()[0])
     m = re.search(r'Overdue\s+(?:Amt)?[:\s]*([\d,]+)', block, re.IGNORECASE)
-    return to_int(m.group(1)) if m else 0
+    if m:
+        return to_int(m.group(1))
+    # OCR sometimes wraps the value onto the line BEFORE the label instead
+    # of after (column reflow drags a SECOND number onto the tail of
+    # Tenure's own row, e.g. "...Tenure(month): 60  29,661\nOverdue Amt:\n" -
+    # the trailing 29,661 is Overdue's value, 60 is still Tenure's own).
+    # Must require BOTH numbers - Tenure's own value AND the spillover one -
+    # not just "whatever number precedes the label". A blank Overdue Amt:
+    # field (common, legitimate: the label just has nothing after it) leaves
+    # only Tenure's own single value sitting right before the label, and a
+    # looser match steals that instead of correctly returning 0 (confirmed
+    # on two real reports - one HTML-exported, one native PDF, neither
+    # scanned/OCR'd at all, so this can't be gated on `scanned`).
+    lm = re.search(
+        r'Tenure\s*\(month\)\s*:\s*[\d,]+\s+([\d,]+)\s*\n\s*Overdue\s+Amt\s*:',
+        block, re.IGNORECASE)
+    if lm:
+        return to_int(lm.group(1))
+    return 0
 
 
 def _extract_emi(block: str) -> int:
@@ -582,6 +652,25 @@ def _extract_loan_type(block: str) -> str:
     for canon, csq in _LOAN_SQUASHED:
         if csq in sq:
             return canon
+
+    # Header corrupted badly enough that OCR wedged garbage between the
+    # type's own words (e.g. "COMMERCIAL VEHICLE cist LOAN") or lost the
+    # "Account Type:" label entirely (its words landed mid-sentence with
+    # other bled-in columns, e.g. "COMMERCIAL Credit Grantor: # Lender
+    # Type: VEHICLE LOAN"), so neither the contiguous squash match above
+    # nor the label-anchored regex below can find it. Fall back to a
+    # fuzzy in-order match: all of a canonical type's words must still
+    # appear in the head, in order, each within a bounded gap of the
+    # next - loose enough to survive bled-in column text, tight enough
+    # that it can't cross into an unrelated sentence.
+    for canon in _LOAN_TYPES:
+        words = re.findall(r'[A-Za-z]+', canon)
+        if len(words) < 2:
+            continue
+        pattern = r'\b' + r'\b.{0,40}?\b'.join(re.escape(w) for w in words) + r'\b'
+        if re.search(pattern, head, re.IGNORECASE | re.DOTALL):
+            return canon
+
     m = re.search(r'Account\s+Type\s*[:.\-=]?\s*([^\n]*)', head, re.IGNORECASE)
     if m:
         val = m.group(1)
@@ -602,8 +691,26 @@ def _extract_loan_type(block: str) -> str:
 # the EMI field (e.g. '2,31,400/Monthly') and must NOT be read as DPD cells.
 _DPD_FREQ = {"MON", "ANN", "MTH", "WK", "QTR", "QUA", "WEE", "HAL", "FOR", "BIM"}
 
+# Some CRIF Retail grids print the DAYS half of the cell itself as a letter
+# placeholder ("XXX/STD") instead of a digit count - "data not reported by
+# institution" per the report's own appendix, distinct from a genuine 0.
+# crif_commercial_parser.py already solved the equivalent problem for
+# Commercial reports (_classification_to_dpd); mirrored here at the same
+# representative-DPD bands (RBI's own SMA-staging convention) so a bare
+# named class still lands in roughly the right colour bucket instead of
+# silently reading as a clean 0 - which would hide a real SUB/DBT/LOS
+# account behind a green cell.
+_LETTER_DPD_MAP = {"STD": 0, "SMA": 1, "SUB": 91, "DBT": 181, "LOS": 181}
+_LETTER_DPD_RE  = re.compile(r'\bXXX\s*/\s*(STD|SMA|SUB|DBT|LOS)\b', re.IGNORECASE)
 
-def _extract_max_dpd(block: str) -> int:
+
+def _letter_placeholder_dpd(region: str):
+    """Representative DPD from 'XXX/CLASS' cells (no digit days at all)."""
+    vals = [_LETTER_DPD_MAP[m.group(1).upper()] for m in _LETTER_DPD_RE.finditer(region)]
+    return max(vals) if vals else None
+
+
+def _extract_max_dpd(block: str):
     # DPD grid cells are "NNN/AssetClass" (e.g. 027/XXX). OCR mangles them two ways:
     #   - the days value loses leading zeros, so it can be 1-3 digits ('24/XXX');
     #   - the asset class is mis-read ('027/KXX' for '027/XXX'), so requiring an exact
@@ -618,19 +725,106 @@ def _extract_max_dpd(block: str) -> int:
         for num, cls in re.findall(r'(?<!\d)(\d{1,3})\s*/\s*([A-Za-z]{2,3})', region)
         if cls.upper() not in _DPD_FREQ and int(num) < 900
     ]
-    return max(vals) if vals else 0
+    if vals:
+        return max(vals)
+    letter_dpd = _letter_placeholder_dpd(region)
+    if letter_dpd is not None:
+        return letter_dpd
+    # No "NNN/class" cell recognised at all. A genuinely blank grid (brand
+    # new account, no history yet) has almost no digits in this region; an
+    # account with a real, populated grid that OCR garbled past recognition
+    # (every slash misread, e.g. "083K" instead of "083/XXX") still carries
+    # plenty of digit clutter (day-codes, year labels). Use that density as
+    # the signal to report "genuinely unreadable" (None -> "Check CIBIL")
+    # instead of silently fabricating a confident zero.
+    if len(re.findall(r'\d', region)) >= 6:
+        return None
+    return 0
+
+
+_YEAR_RE = re.compile(r'(?<!\d)(20\d{2})\s*\n')
+_CELL_RE = re.compile(r'((?:\d{1,3}|XXX)\s*/\s*[A-Za-z]{2,3}|-)')
+
+
+def _cell_to_dpd(token: str):
+    """One grid cell -> its DPD reading, or None if the cell itself is
+    unreadable/blank ('-' = not yet elapsed / no data that month)."""
+    token = token.strip()
+    if token == '-':
+        return None
+    m = re.match(r'(\d{1,3}|XXX)\s*/\s*([A-Za-z]{2,3})', token, re.IGNORECASE)
+    if not m:
+        return None
+    days_part, cls = m.group(1), m.group(2).upper()
+    if cls in _DPD_FREQ:
+        return None
+    if days_part.upper() == 'XXX':
+        return _LETTER_DPD_MAP.get(cls)
+    if int(days_part) > 999:
+        return None
+    return int(days_part)
+
+
+def _extract_dpd_window(block: str):
+    """
+    Reads the payment-history grid in true chronological order
+    (most-recent-first) to derive:
+      - last_reported_dpd: the most recently populated month's DPD
+      - max_dpd_12mo: the worst DPD across the trailing 12 populated months
+
+    CRIF prints year blocks most-recent-year-first, each with 12 month
+    cells left-to-right (Jan..Dec); reading a year block's cells in
+    reverse (Dec..Jan) and walking year blocks top-to-bottom therefore
+    yields cells in most-recent-first chronological order. A repeated
+    year label marks a stale duplicate grid (seen on a real corrupted/
+    merged block) and stops the scan.
+
+    Returns (None, None) if no grid data could be read at all.
+    """
+    m = re.search(r'Payment\s+History', block, re.IGNORECASE)
+    region = block[m.end():] if m else block
+    year_matches = list(_YEAR_RE.finditer(region))
+    if not year_matches:
+        return None, None
+
+    chronological = []  # most-recent-first, real (non-blank) readings only
+    seen_years = set()
+    for i, ym in enumerate(year_matches):
+        if len(chronological) >= 12:
+            break
+        year = ym.group(1)
+        if year in seen_years:
+            break
+        seen_years.add(year)
+        cell_start = ym.end()
+        cell_end = year_matches[i + 1].start() if i + 1 < len(year_matches) else len(region)
+        cells = _CELL_RE.findall(region[cell_start:cell_end])[:12]
+        for token in reversed(cells):
+            dpd = _cell_to_dpd(token)
+            if dpd is not None:
+                chronological.append(dpd)
+            if len(chronological) >= 12:
+                break
+
+    if not chronological:
+        return None, None
+    return chronological[0], max(chronological[:12])
 
 
 def _has_written_off_signal(block: str) -> bool:
     """
-    Shared by _is_closed (rules 2 & 4) and _is_written_off - Remarks text
-    naming a write-off, or a non-zero write-off amount field. Factored out
-    so the two regex pairs can't drift apart from each other the way the UI
-    badge's overdue tolerance once drifted from validate_extraction()'s.
+    Shared by _is_closed (rules 2 & 4) and _is_written_off - a non-zero
+    write-off amount field. Remarks text alone ("Written-off") is NOT
+    sufficient: CRIF prints that word on still-open, still-reporting
+    accounts too (a historical/partial write-off note, or bleed-through
+    from a co-obligant's own record) while Total/Principal Writeoff Amt
+    stays 0 and the account keeps getting monthly DPD updates - confirmed
+    on a real report where 5 genuinely active accounts (zero balance,
+    zero write-off amount, live DPD grid) were wrongly flipped to Closed
+    by remarks text alone. Factored out so the two regex pairs can't drift
+    apart from each other the way the UI badge's overdue tolerance once
+    drifted from validate_extraction()'s.
     """
-    rem_m = re.search(r'Remarks\s*:\s*\n\s*([^\n]+)', block)
-    if rem_m and re.search(r'written.?off', rem_m.group(1), re.IGNORECASE):
-        return True
     wo_m = re.search(
         r'(?:Total\s+)?Write\s*[- ]?[Oo]ff\s+Amt[:\s]*\n?\s*([\d,]+)',
         block, re.IGNORECASE,
@@ -641,9 +835,10 @@ def _has_written_off_signal(block: str) -> bool:
 def _is_closed(block: str) -> bool:
     """
     Rule 1: Closed Date has a valid date.
-    Rule 2: Remarks contains 'Written-off'.
+    Rule 2: Total/write-off amount field is non-zero (see
+            _has_written_off_signal - remarks text alone is deliberately
+            NOT trusted here).
     Rule 3: Compact block  -  'Closed' before any field label.
-    Rule 4: Total write-off amount field is non-zero.
     """
     val = _next_line_value(block, "Closed Date:")
     if val and re.match(r'\d{2}-\d{2}-\d{4}', val):
@@ -727,7 +922,11 @@ def build_positional_dpd(text: str) -> list:
             for num, cls in re.findall(r'(?<!\d)(\d{1,3})\s*/\s*([A-Za-z]{2,3})', segment)
             if cls.upper() not in _DPD_FREQ and int(num) < 900
         ]
-        result.append(max(vals) if vals else 0)
+        if vals:
+            result.append(max(vals))
+        else:
+            letter_dpd = _letter_placeholder_dpd(segment)
+            result.append(letter_dpd if letter_dpd is not None else 0)
     return result
 
 
@@ -738,6 +937,32 @@ def build_positional_dpd(text: str) -> list:
 def extract_account(acct_num: int, block: str,
                     loan_type: str = None, entity: str = None,
                     max_dpd: int = None) -> dict:
+    block_dpd = _extract_max_dpd(block)
+    last_reported_dpd, max_dpd_12mo = _extract_dpd_window(block)
+    # Positional dpd (from the compact summary grid) and the block's own dpd
+    # can each be a genuine int or an unreadable None - take the higher of
+    # the two when both are readable, otherwise whichever one is.
+    #
+    # KNOWN GAP (investigated, not fixed): on page-dense reports where one
+    # block's captured span holds more than one "As on:" grid section, this
+    # max() can let a sibling account's higher DPD silently win over the
+    # correct positional read (confirmed on a real report - 5 accounts with
+    # measurably wrong max_dpd, e.g. 556 vs the true 182). No reliable way
+    # was found to detect this from the text alone: the report masks Account
+    # #/Credit Grantor identically ("xxxx") across both a genuine same-
+    # account re-report (multiple "As on:" snapshots of ONE account's own
+    # evolving history - where trusting the higher block-scanned value is
+    # correct and intentional) and true sibling contamination (a different
+    # account's grid bled in) - and both shapes occur in real reports,
+    # including ones otherwise verified fully correct. Flagging here rather
+    # than shipping an untested heuristic that could silently break the
+    # legitimate case.
+    if max_dpd is None:
+        combined_dpd = block_dpd
+    elif block_dpd is None:
+        combined_dpd = max_dpd
+    else:
+        combined_dpd = max(max_dpd, block_dpd)
     return {
         "sr_no":            acct_num,
         "date_of_sanction": _extract_date(block),
@@ -748,7 +973,9 @@ def extract_account(acct_num: int, block: str,
         "entity":           entity if entity else _extract_entity(block),
         "ownership":        _extract_ownership(block),
         "type_of_loan":     loan_type if loan_type else _extract_loan_type(block),
-        "max_dpd":          max(max_dpd, _extract_max_dpd(block)) if max_dpd is not None else _extract_max_dpd(block),
+        "max_dpd":          combined_dpd,
+        "last_reported_dpd": last_reported_dpd,
+        "max_dpd_12mo":     max_dpd_12mo,
         "status":           "Closed" if _is_closed(block) else "Active",
         "written_off":      _is_written_off(block),
     }
