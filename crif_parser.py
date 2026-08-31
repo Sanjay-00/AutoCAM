@@ -743,7 +743,7 @@ def _extract_max_dpd(block: str):
 
 
 _YEAR_RE = re.compile(r'(?<!\d)(20\d{2})\s*\n')
-_CELL_RE = re.compile(r'((?:\d{1,3}|XXX)\s*/\s*[A-Za-z]{2,3}|-)')
+_CELL_RE = re.compile(r'((?:\d{1,3}|XXX)\s*/\s*[A-Za-z]{2,3}|-)', re.IGNORECASE)
 
 
 def _cell_to_dpd(token: str):
@@ -760,6 +760,11 @@ def _cell_to_dpd(token: str):
         return None
     if days_part.upper() == 'XXX':
         return _LETTER_DPD_MAP.get(cls)
+    # Reject only 4-digit misreads (>999), not 3-digit values like 900.
+    # Unlike _extract_max_dpd's >= 900 floor (which guards against
+    # leading-zero misreads in flattened, OCR-degraded regions), this
+    # function's year/month-anchored reads are more structurally reliable,
+    # so 900 itself is plausible and accepted here.
     if int(days_part) > 999:
         return None
     return int(days_part)
