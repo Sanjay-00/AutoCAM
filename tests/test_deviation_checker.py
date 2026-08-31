@@ -84,6 +84,25 @@ def test_unreadable_dpd_marks_unable_to_verify_not_pass():
     assert v["parameters"]["last_dpd"]["status"] == "unable_to_verify"
 
 
+def test_incomplete_flag_true_when_dpd_unreadable():
+    # DPD grids unreadable -> parameters report unable_to_verify, not pass -
+    # overall_approval stays None (no confirmed breach) but `incomplete`
+    # must flag that this is NOT the same as a clean report (Finding 1).
+    data = {"provider": "crif", "score": 700, "accounts": [
+        _account(last_reported_dpd=None, max_dpd_12mo=None)
+    ]}
+    v = evaluate_deviation(data, loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v["overall_approval"] is None
+    assert v["incomplete"] is True
+
+
+def test_incomplete_flag_false_on_fully_clean_report():
+    data = {"provider": "crif", "score": 700, "accounts": [_account()]}
+    v = evaluate_deviation(data, loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v["overall_approval"] is None
+    assert v["incomplete"] is False
+
+
 def test_non_individual_uses_cmr_threshold():
     data = {"provider": "transunion", "score": "CMR-8", "accounts": [_account(ownership="NON-INDIVIDUAL")]}
     v = evaluate_deviation(data, loan_amount=10_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="non_individual")

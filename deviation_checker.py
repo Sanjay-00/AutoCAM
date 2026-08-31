@@ -138,6 +138,7 @@ def evaluate_deviation(data: dict, loan_amount: int, vehicle_category: str, enti
                 "written_off": {**na, "manual_review": []},
             },
             "overall_approval": None,
+            "incomplete": False,
         }
 
     score_result = _score_status(data, slab)
@@ -212,9 +213,17 @@ def evaluate_deviation(data: dict, loan_amount: int, vehicle_category: str, enti
         if auth and _APPROVAL_RANK[auth] > _APPROVAL_RANK[overall]:
             overall = auth
 
+    # overall_approval only aggregates `authority` values, which are also
+    # None for every "unable_to_verify" parameter - so a report with
+    # unreadable DPD data and no other breach would otherwise look
+    # identical to a genuinely clean report. `incomplete` lets the UI tell
+    # those two cases apart instead of showing a false "all clear".
+    incomplete = any(p.get("status") == "unable_to_verify" for p in parameters.values())
+
     return {
         "slab": slab["label"],
         "excluded_accounts": excluded_accounts,
         "parameters": parameters,
         "overall_approval": overall,
+        "incomplete": incomplete,
     }

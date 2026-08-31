@@ -530,6 +530,11 @@ if loan_amount > 0:
     if verdict["overall_approval"]:
         st.error(f"⚠️  Deviation required - **{verdict['overall_approval']}** approval "
                  f"(matched slab: {verdict['slab']})")
+    elif verdict["incomplete"]:
+        st.warning(
+            "⚠️ Deviation check incomplete - some data could not be verified "
+            f"(matched slab: {verdict['slab']}). See the ❓ parameters below."
+        )
     else:
         st.success(f"✅  No deviation required (matched slab: {verdict['slab']})")
 
@@ -546,8 +551,15 @@ if loan_amount > 0:
             line += f" → **{p['authority']}** approval"
         st.markdown(line)
         breaching = p.get("breaching_accounts")
-        if breaching:
+        # Only render breaching_accounts on an actual failure - a "pass"
+        # status can still carry sub-threshold accounts (e.g. overdue_dpd's
+        # 1-30 day tier, kept for bookkeeping) and showing them under a
+        # ✅ pass line reads as self-contradictory (Finding 5).
+        if breaching and p["status"] == "fail":
             st.caption("Accounts: " + ", ".join(str(a.get("sr_no")) for a in breaching))
+        unreadable = p.get("unreadable_accounts")
+        if unreadable:
+            st.caption("Unreadable: " + ", ".join(str(a.get("sr_no")) for a in unreadable))
         if key == "written_off" and p.get("manual_review"):
             st.caption(
                 "🔎 Manually check if any of these are >3 years old from application "
