@@ -742,7 +742,7 @@ def _extract_max_dpd(block: str):
     return 0
 
 
-_YEAR_RE = re.compile(r'(?<!\d)(20\d{2})\s*\n')
+_YEAR_RE = re.compile(r'(?<![\d-])(20\d{2})\s*\n')
 _CELL_RE = re.compile(r'((?:\d{1,3}|XXX)\s*/\s*[A-Za-z]{2,3}|-)', re.IGNORECASE)
 
 
@@ -760,12 +760,16 @@ def _cell_to_dpd(token: str):
         return None
     if days_part.upper() == 'XXX':
         return _LETTER_DPD_MAP.get(cls)
-    # Reject only 4-digit misreads (>999), not 3-digit values like 900.
-    # Unlike _extract_max_dpd's >= 900 floor (which guards against
-    # leading-zero misreads in flattened, OCR-degraded regions), this
-    # function's year/month-anchored reads are more structurally reliable,
-    # so 900 itself is plausible and accepted here.
-    if int(days_part) > 999:
+    # Aligned with _extract_max_dpd's own >= 900 floor: both functions read
+    # the same "NNN/class" grid-cell format, and a >= 900 day count is
+    # overwhelmingly a leading-zero OCR misread (e.g. "000" -> "900") rather
+    # than a real value, on this reader as much as on that one. Treating the
+    # two functions differently on the same input previously let the
+    # accounts table show a clean max_dpd (rejected as noise) while this
+    # window reader accepted the same cell as real and demanded RBH/ZCC
+    # deviation approval for it - a contradiction with nothing on screen to
+    # explain it. Reject here too rather than silently diverging.
+    if int(days_part) >= 900:
         return None
     return int(days_part)
 
@@ -790,7 +794,15 @@ def _extract_dpd_window(block: str):
     region = block[m.end():] if m else block
     year_matches = list(_YEAR_RE.finditer(region))
     if not year_matches:
-        return None, None
+        # No recognisable year label at all. Mirror _extract_max_dpd's own
+        # digit-density heuristic: a genuinely blank grid (brand new
+        # account, no history yet) has almost no digits in this region, so
+        # that's a confident (0, 0) - not "unreadable". A digit-dense region
+        # with no year label we could parse is genuinely garbled, and stays
+        # (None, None).
+        if len(re.findall(r'\d', region)) >= 6:
+            return None, None
+        return 0, 0
 
     chronological = []  # most-recent-first, real (non-blank) readings only
     seen_years = set()

@@ -3,14 +3,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from crif_parser import _extract_dpd_window
 
 def test_single_year_partial_grid_last_reported_is_rightmost_populated():
+    # 875 (not the disputed 900 boundary - see Finding 7 of the whole-branch
+    # review, which aligned this reader's ceiling to _extract_max_dpd's own
+    # >= 900 "reject as OCR noise" floor) still clearly demonstrates
+    # "rightmost populated cell wins" without touching that threshold.
     block = (
         "Payment History/Asset Classification:\n"
         "Jan\nFeb\nMar\nApr\nMay\nJun\nJul\nAug\nSep\nOct\nNov\nDec\n"
-        "2026\n900/XXX\n900/XXX\n900/XXX\n900/XXX\n900/XXX\n900/XXX\n-\n-\n-\n-\n-\n-\n"
+        "2026\n875/XXX\n875/XXX\n875/XXX\n875/XXX\n875/XXX\n875/XXX\n-\n-\n-\n-\n-\n-\n"
     )
     last_reported, max_12mo = _extract_dpd_window(block)
-    assert last_reported == 900
-    assert max_12mo == 900
+    assert last_reported == 875
+    assert max_12mo == 875
 
 def test_window_spans_year_boundary():
     block = (
@@ -37,10 +41,61 @@ def test_letter_placeholder_cells_map_to_representative_dpd():
     assert max_12mo == 181       # Jan = XXX/LOS -> 181, worst in window
 
 def test_unreadable_grid_returns_none_none():
-    block = "Payment History/Asset Classification:\nNo grid data of any kind here.\n"
+    # Digit-dense (garbled OCR noise) but no parseable "NNN/class" cell or
+    # year label - genuinely unreadable, not a blank/new-account grid.
+    # (Finding 3: the original version of this block had zero digits at
+    # all, which under the digit-density heuristic now shared with
+    # _extract_max_dpd actually reads as a confident blank (0, 0), not
+    # "unreadable" - updated to a properly digit-dense garbled sample so
+    # this test still exercises the None/None path it's named for.)
+    block = "Payment History/Asset Classification:\n038K 019K 902K 011K 384K 720K\n"
     last_reported, max_12mo = _extract_dpd_window(block)
     assert last_reported is None
     assert max_12mo is None
+
+def test_blank_grid_with_no_year_label_reads_as_confident_zero():
+    # No year-block label at all, but also no real grid content - a
+    # genuinely blank/new-account grid, same case _extract_max_dpd already
+    # treats as a confident 0 via its digit-density heuristic (Finding 3).
+    block = (
+        "Payment History/Asset Classification:\n"
+        "No history reported for this account.\n"
+    )
+    last_reported, max_12mo = _extract_dpd_window(block)
+    assert last_reported == 0
+    assert max_12mo == 0
+
+
+def test_garbled_grid_with_no_year_label_still_returns_none_none():
+    # No recognisable year label, but the region is digit-dense (garbled
+    # grid, not a blank one) - stays unreadable, unlike the blank case above.
+    block = (
+        "Payment History/Asset Classification:\n"
+        "038K 019K 902K 011K 384K 720K 293K 048K\n"
+    )
+    last_reported, max_12mo = _extract_dpd_window(block)
+    assert last_reported is None
+    assert max_12mo is None
+
+
+def test_as_on_date_year_does_not_corrupt_the_scan():
+    # "As on: 31-03-2026" carries a "2026" that must NOT be mistaken for a
+    # grid year-block label - if it is, it gets consumed as a bogus
+    # zero-cell block, and then the real "2026\n" label hits the
+    # duplicate-year guard and breaks the scan early (Finding 4).
+    # Single populated cell so the assertion doesn't depend on within-year
+    # cell-ordering convention - only on whether the "As on" date's year
+    # gets misread as a bogus grid-year-block label.
+    block = (
+        "Payment History/Asset Classification:\n"
+        "As on: 31-03-2026\n"
+        "Jan\nFeb\nMar\nApr\nMay\nJun\nJul\nAug\nSep\nOct\nNov\nDec\n"
+        "2026\n-\n-\n045/XXX\n-\n-\n-\n-\n-\n-\n-\n-\n-\n"
+    )
+    last_reported, max_12mo = _extract_dpd_window(block)
+    assert last_reported == 45
+    assert max_12mo == 45
+
 
 def test_corrupted_block_stops_at_repeated_year_label():
     # A merged/corrupted block repeats the whole grid section - the second
