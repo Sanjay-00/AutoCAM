@@ -879,6 +879,8 @@ def extract_account(ordinal: int, block: str, scanned: bool = False) -> dict:
         "ownership":        _extract_ownership(clean),
         "type_of_loan":     _extract_loan_type(clean),
         "max_dpd":          _extract_max_dpd(clean),
+        "last_reported_dpd": current_dpd,
+        "max_dpd_12mo":       _extract_max_dpd(clean),
         "status":           status,
         # Delinquent is an overlay on a still-OPEN account - a Closed/Written
         # Off/Settled account can carry a non-Standard classification too
