@@ -408,6 +408,35 @@ def _normalize(accounts: list) -> list:
     return accounts
 
 
+def _reattach_ownership(new_accounts: list, old_accounts: list) -> list:
+    """
+    LLM/Vision correction and full re-extraction paths (_llm_fix_blocks,
+    _llm_full, and CRIF Commercial's vision_extract_accounts) request their
+    own field list from the model, which doesn't include `ownership` -
+    deviation_checker.py's Guarantor/Joint-capacity exclusion reads that
+    field, so silently dropping it re-enables a policy check the bureau
+    data itself says shouldn't apply. `ownership` is a bureau-formatting-
+    derived field (parsed from fixed label text, not free-form prose) that
+    an LLM correcting other fields has no reason to touch, so it's cheaper
+    and lower-risk to reattach it from the pre-fallback rule-based
+    extraction than to teach every prompt to preserve it. Matched by
+    sr_no (each fallback is asked not to add/remove accounts, so sr_no
+    should still line up); falls back to positional index when sr_no
+    drifted or the fallback is a full independent re-extraction.
+    """
+    if not old_accounts:
+        return new_accounts
+    by_sr = {a.get("sr_no"): a.get("ownership") for a in old_accounts if a.get("sr_no") is not None}
+    for i, acc in enumerate(new_accounts):
+        if acc.get("ownership"):
+            continue
+        own = by_sr.get(acc.get("sr_no"))
+        if not own and i < len(old_accounts):
+            own = old_accounts[i].get("ownership")
+        acc["ownership"] = own or ""
+    return new_accounts
+
+
 def _llm_fix_blocks(blocks: list, current: list, api_key: str) -> tuple:
     blocks_text = "\n\n__ACCOUNT__\n\n".join(
         f"ACCOUNT {num}:\n{blk[:1800]}" for num, blk in blocks
@@ -606,6 +635,11 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
     """
     name, score, blocks, accounts, reported, analysis = parse_crif_commercial(text, scanned)
     _renumber(accounts)
+    # Snapshot of the rule-based extraction, used below to reattach
+    # `ownership` onto the Vision re-extraction if it's adopted (see
+    # Finding 2 / _reattach_ownership's docstring) - _VISION_PROMPT doesn't
+    # request that field.
+    rule_based_accounts = accounts
 
     # Borrower Summary carries Sanctioned/Overdue totals alongside the
     # Live-Accts/Outstanding pair extract_reported_totals() already puts in
@@ -637,6 +671,7 @@ def _parse_crif_commercial(text, doc, scanned, page_texts, api_key,
         )
         if vis:
             _renumber(vis)
+            _reattach_ownership(vis, rule_based_accounts)
             v_vis = validate_extraction(vis, reported, amount_floor=50_000)
             if _val_quality(v_vis) > _val_quality(validation):
                 accounts, validation, method = vis, v_vis, METHOD_VISION
@@ -768,9 +803,15 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
 
     # Stage 2: LLM block-fix
     if not validation["valid"] and api_key:
+        # Snapshot of the rule-based extraction before any fallback replaces
+        # `accounts` - used below to reattach `ownership` (see Finding 2 /
+        # _reattach_ownership's docstring), since neither LLM stage's prompt
+        # requests that field.
+        rule_based_accounts = accounts
         fixed, ok = _llm_fix_blocks(blocks, accounts, api_key)
         if ok:
             _renumber(fixed)
+            _reattach_ownership(fixed, rule_based_accounts)
             v2 = validate_extraction(fixed, reported, overdue_scope_all_accounts=True)
             if v2["valid"]:
                 accounts          = fixed
@@ -781,6 +822,7 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
                 full, ok2 = _llm_full(text, api_key, reported.get("account_count"))
                 if ok2 and full:
                     _renumber(full)
+                    _reattach_ownership(full, rule_based_accounts)
                     accounts          = full
                     extraction_method = METHOD_LLM_FULL
                     validation        = validate_extraction(accounts, reported, overdue_scope_all_accounts=True)
