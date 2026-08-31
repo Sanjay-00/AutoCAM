@@ -258,10 +258,11 @@ with col_dpd:
     use_vision_dpd = st.checkbox(
         "Use Gemini Vision fallback",
         value=False,
-        help="Off by default - normal rule-based OCR runs first for scanned CRIF Commercial "
-             "reports. Tick this to let Gemini step in when needed: (1) re-extracts accounts "
-             "from page images if OCR fails the report's own summary validation, and "
-             "(2) reads DPD from coloured payment-history cells OCR can't read. "
+        help="Off by default - normal rule-based OCR runs first for scanned CRIF reports. "
+             "Tick this to let Gemini step in when needed: (1) CRIF Commercial only - "
+             "re-extracts accounts from page images if OCR fails the report's own summary "
+             "validation, and (2) CRIF Commercial and Retail - reads DPD from coloured "
+             "payment-history cells OCR can't read. "
              "Adds ~15s and costs ~₹0.17 per report. Re-run extraction after ticking.",
     )
 
