@@ -132,7 +132,7 @@ def evaluate_deviation(data: dict, loan_amount: int, vehicle_category: str, enti
             "excluded_accounts": excluded_accounts,
             "parameters": {
                 "score": {"status": "not_applicable", "value": None, "threshold": None, "authority": None},
-                "overdue_dpd": dict(na),
+                "overdue_dpd": {**na, "unreadable_accounts": []},
                 "dpd_12mo": {**na, "unreadable_accounts": []},
                 "last_dpd": {**na, "unreadable_accounts": []},
                 "written_off": {**na, "manual_review": []},
@@ -144,12 +144,16 @@ def evaluate_deviation(data: dict, loan_amount: int, vehicle_category: str, enti
     if score_result["status"] == "fail":
         score_result["authority"] = approval["score"]
 
-    overdue_breaches = [
+    overdue_over_threshold = [
         a for a in included_accounts
         if (a.get("overdue") or 0) > slab["overdue_threshold"]
-        and (a.get("last_reported_dpd") or 0) > 0
     ]
-    overdue_worst_dpd = max((a.get("last_reported_dpd") or 0) for a in overdue_breaches) if overdue_breaches else 0
+    overdue_unreadable = [a for a in overdue_over_threshold if a.get("last_reported_dpd") is None]
+    overdue_breaches = [
+        a for a in overdue_over_threshold
+        if a.get("last_reported_dpd") is not None and a.get("last_reported_dpd") > 0
+    ]
+    overdue_worst_dpd = max((a.get("last_reported_dpd") for a in overdue_breaches), default=0)
     overdue_authority = _escalate(overdue_worst_dpd, approval["overdue_dpd"]) if overdue_breaches else None
 
     dpd12_unreadable = [a for a in included_accounts if a.get("max_dpd_12mo") is None]
@@ -165,7 +169,7 @@ def evaluate_deviation(data: dict, loan_amount: int, vehicle_category: str, enti
             return True
         if a.get("suit_filed"):
             return True
-        if (a.get("max_dpd_12mo") or 0) >= 181:  # Loss bucket
+        if a.get("max_dpd_12mo") is not None and a.get("max_dpd_12mo") >= 181:  # Loss bucket
             return True
         return False
 
@@ -174,8 +178,12 @@ def evaluate_deviation(data: dict, loan_amount: int, vehicle_category: str, enti
     parameters = {
         "score": score_result,
         "overdue_dpd": {
-            "status": "fail" if overdue_breaches else "pass",
+            "status": (
+                "unable_to_verify" if (overdue_unreadable and not overdue_breaches)
+                else ("fail" if overdue_authority else "pass")
+            ),
             "breaching_accounts": overdue_breaches,
+            "unreadable_accounts": overdue_unreadable,
             "authority": overdue_authority,
         },
         "dpd_12mo": {

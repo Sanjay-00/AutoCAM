@@ -109,3 +109,122 @@ def test_crif_commercial_score_is_info_only():
     data = {"provider": "crif_commercial", "score": "3 (High Risk)", "accounts": [_account()]}
     v = evaluate_deviation(data, loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="non_individual")
     assert v["parameters"]["score"]["status"] == "info_only"
+
+
+# --- Slab-boundary tests (design-spec Testing section gap) -----------------
+
+def test_loan_amount_slab_boundaries():
+    data = {"provider": "crif", "score": 700, "accounts": [_account()]}
+
+    # cv_pv_ce_machinery: "Up to 20L" is inclusive (<=), exactly 20L stays in it.
+    v_20l = evaluate_deviation(data, loan_amount=2_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_20l["slab"] == "Up to 20L"
+    v_20l_plus1 = evaluate_deviation(data, loan_amount=2_000_001, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_20l_plus1["slab"] == ">20-50L"
+
+    # cv_pv_ce_machinery: ">20-50L" is inclusive (<=), exactly 50L stays in it.
+    v_50l = evaluate_deviation(data, loan_amount=5_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_50l["slab"] == ">20-50L"
+    v_50l_plus1 = evaluate_deviation(data, loan_amount=5_000_001, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_50l_plus1["slab"] == ">50L"
+
+    # private_car: "<5L" is strict/exclusive - exactly 5L falls into "5-20L", not "<5L".
+    v_5l = evaluate_deviation(data, loan_amount=500_000, vehicle_category="private_car", entity_type="individual")
+    assert v_5l["slab"] == "5-20L"
+    v_5l_minus1 = evaluate_deviation(data, loan_amount=499_999, vehicle_category="private_car", entity_type="individual")
+    assert v_5l_minus1["slab"] == "<5L"
+
+
+def test_score_boundaries_550_and_600():
+    # "Up to 20L" slab: min_score 550, boundary is inclusive pass (>=).
+    v_549 = evaluate_deviation({"provider": "crif", "score": 549, "accounts": [_account()]},
+                                loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_549["parameters"]["score"]["status"] == "fail"
+    v_550 = evaluate_deviation({"provider": "crif", "score": 550, "accounts": [_account()]},
+                                loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_550["parameters"]["score"]["status"] == "pass"
+
+    # ">20-50L" slab: min_score 600, boundary is inclusive pass (>=).
+    v_599 = evaluate_deviation({"provider": "crif", "score": 599, "accounts": [_account()]},
+                                loan_amount=3_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_599["parameters"]["score"]["status"] == "fail"
+    v_600 = evaluate_deviation({"provider": "crif", "score": 600, "accounts": [_account()]},
+                                loan_amount=3_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_600["parameters"]["score"]["status"] == "pass"
+
+
+def test_overdue_threshold_boundary_exactly_5000_and_10000_not_breach():
+    # Policy says "> Rs.5000" - exactly at the threshold is NOT a breach.
+    data_5000 = {"provider": "crif", "score": 700, "accounts": [
+        _account(overdue=5000, last_reported_dpd=45)
+    ]}
+    v_5000 = evaluate_deviation(data_5000, loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_5000["parameters"]["overdue_dpd"]["status"] == "pass"
+    assert v_5000["parameters"]["overdue_dpd"]["breaching_accounts"] == []
+
+    # >50L slab uses a 10000 overdue threshold - exactly at it is also not a breach.
+    data_10000 = {"provider": "crif", "score": 700, "accounts": [
+        _account(overdue=10000, last_reported_dpd=45)
+    ]}
+    v_10000 = evaluate_deviation(data_10000, loan_amount=6_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_10000["slab"] == ">50L"
+    assert v_10000["parameters"]["overdue_dpd"]["status"] == "pass"
+    assert v_10000["parameters"]["overdue_dpd"]["breaching_accounts"] == []
+
+
+def test_dpd_escalation_boundaries_30_60_90():
+    # overdue_dpd: tiers are (30, RBH), (60, ZCC), both "greater than" thresholds.
+    v_30 = evaluate_deviation(
+        {"provider": "crif", "score": 700, "accounts": [_account(overdue=6000, last_reported_dpd=30)]},
+        loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_30["parameters"]["overdue_dpd"]["authority"] is None
+    assert v_30["parameters"]["overdue_dpd"]["status"] == "pass"  # breach exists but no tier reached (ruling #2)
+
+    v_31 = evaluate_deviation(
+        {"provider": "crif", "score": 700, "accounts": [_account(overdue=6000, last_reported_dpd=31)]},
+        loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_31["parameters"]["overdue_dpd"]["authority"] == "RBH"
+    assert v_31["parameters"]["overdue_dpd"]["status"] == "fail"
+
+    v_60 = evaluate_deviation(
+        {"provider": "crif", "score": 700, "accounts": [_account(overdue=6000, last_reported_dpd=60)]},
+        loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_60["parameters"]["overdue_dpd"]["authority"] == "RBH"
+
+    v_61 = evaluate_deviation(
+        {"provider": "crif", "score": 700, "accounts": [_account(overdue=6000, last_reported_dpd=61)]},
+        loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_61["parameters"]["overdue_dpd"]["authority"] == "ZCC"
+
+    # dpd_12mo: threshold is "> 90" - exactly 90 is not a breach, 91 is.
+    v_dpd12_90 = evaluate_deviation(
+        {"provider": "crif", "score": 700, "accounts": [_account(max_dpd_12mo=90)]},
+        loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_dpd12_90["parameters"]["dpd_12mo"]["status"] == "pass"
+
+    v_dpd12_91 = evaluate_deviation(
+        {"provider": "crif", "score": 700, "accounts": [_account(max_dpd_12mo=91)]},
+        loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_dpd12_91["parameters"]["dpd_12mo"]["status"] == "fail"
+
+
+def test_overdue_breach_with_unreadable_dpd_is_unable_to_verify_not_silent_pass():
+    # overdue exceeds the threshold but last_reported_dpd is None (unreadable) -
+    # must NOT be silently coerced to DPD=0 and passed.
+    data = {"provider": "crif", "score": 700, "accounts": [
+        _account(overdue=6000, last_reported_dpd=None)
+    ]}
+    v = evaluate_deviation(data, loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v["parameters"]["overdue_dpd"]["status"] == "unable_to_verify"
+    assert v["parameters"]["overdue_dpd"]["breaching_accounts"] == []
+    assert len(v["parameters"]["overdue_dpd"]["unreadable_accounts"]) == 1
+    assert v["parameters"]["overdue_dpd"]["authority"] is None
+
+    # A confidently-read DPD of 0 with an overdue breach is NOT a breach either
+    # (the "Overdue with DPD" condition needs concurrent DPD).
+    data_confident_zero = {"provider": "crif", "score": 700, "accounts": [
+        _account(overdue=6000, last_reported_dpd=0)
+    ]}
+    v_zero = evaluate_deviation(data_confident_zero, loan_amount=1_000_000, vehicle_category="cv_pv_ce_machinery", entity_type="individual")
+    assert v_zero["parameters"]["overdue_dpd"]["status"] == "pass"
+    assert v_zero["parameters"]["overdue_dpd"]["unreadable_accounts"] == []
