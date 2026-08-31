@@ -18,6 +18,7 @@ from parser import (
     METHOD_OCR, METHOD_VISION,
 )
 from excel_generator import generate_excel, get_filename
+from deviation_checker import evaluate_deviation
 
 st.set_page_config(
     page_title="AutoCAM  -  CIBIL",
@@ -495,6 +496,70 @@ if data["extraction_method"] == METHOD_OCR:
         "grid has tiny digits that OCR can misread. Verify against the PDF for any "
         "delinquent (non-zero DPD) account before relying on it."
     )
+
+# ── Deviation Approval Checker (CV Policy Annexure-IV, p.16) ───────
+st.divider()
+st.markdown("#### 🛂 Deviation Approval Checker")
+st.caption(
+    "Checks the extracted bureau data against CV Policy Annexure-IV "
+    "(Bureau Validation). Manually verify any account flagged for the "
+    "written-off >3-year carve-out - the policy leaves that to judgment."
+)
+dev_col1, dev_col2, dev_col3 = st.columns(3)
+with dev_col1:
+    vehicle_category = st.selectbox(
+        "Vehicle Category",
+        options=["cv_pv_ce_machinery", "private_car"],
+        format_func=lambda v: "CV / PV / CE / Machinery" if v == "cv_pv_ce_machinery" else "Private Car",
+        key="dev_vehicle_category",
+    )
+with dev_col2:
+    entity_type = st.selectbox(
+        "Entity Type",
+        options=["individual", "non_individual"],
+        format_func=lambda v: "Individual" if v == "individual" else "Non-Individual",
+        key="dev_entity_type",
+    )
+with dev_col3:
+    loan_amount = st.number_input(
+        "Loan Amount (₹)", min_value=0, step=10_000, value=0, key="dev_loan_amount",
+    )
+
+if loan_amount > 0:
+    verdict = evaluate_deviation(data, loan_amount, vehicle_category, entity_type)
+    if verdict["overall_approval"]:
+        st.error(f"⚠️  Deviation required - **{verdict['overall_approval']}** approval "
+                 f"(matched slab: {verdict['slab']})")
+    else:
+        st.success(f"✅  No deviation required (matched slab: {verdict['slab']})")
+
+    _PARAM_LABELS = {
+        "score": "Score", "overdue_dpd": "Overdue with DPD",
+        "dpd_12mo": ">90 DPD in last 12 months", "last_dpd": "Last reported DPD",
+        "written_off": "Written-off / Suit Filed / Settled / Loss",
+    }
+    for key, label in _PARAM_LABELS.items():
+        p = verdict["parameters"][key]
+        icon = {"pass": "✅", "fail": "❌", "info_only": "ℹ️", "unable_to_verify": "❓", "not_applicable": "⬜"}[p["status"]]
+        line = f"{icon} **{label}**: {p['status']}"
+        if p.get("authority"):
+            line += f" → **{p['authority']}** approval"
+        st.markdown(line)
+        breaching = p.get("breaching_accounts")
+        if breaching:
+            st.caption("Accounts: " + ", ".join(str(a.get("sr_no")) for a in breaching))
+        if key == "written_off" and p.get("manual_review"):
+            st.caption(
+                "🔎 Manually check if any of these are >3 years old from application "
+                "date with otherwise-good running repayment - policy allows a carve-out."
+            )
+
+    if verdict["excluded_accounts"]:
+        with st.expander(f"Excluded from check ({len(verdict['excluded_accounts'])} account(s))"):
+            for a in verdict["excluded_accounts"]:
+                st.caption(f"Sr.No {a.get('sr_no')}: {a['exclusion_reason']}")
+else:
+    st.caption("Enter a loan amount above to run the deviation check.")
 
 # ── Credit Analysis  (CRIF Retail + Commercial - shapes differ)  ───
 analysis = data.get("analysis")
