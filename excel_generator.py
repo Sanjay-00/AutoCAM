@@ -413,7 +413,7 @@ def generate_excel(data: dict) -> bytes:
     # ────────────────────────────────────────
     analysis = data.get("analysis")
     if analysis:
-        _build_credit_analysis_sheet(wb, analysis, accounts)
+        _build_credit_analysis_sheet(wb, analysis)
 
     # ────────────────────────────────────────
     # SAVE TO BYTES BUFFER
@@ -461,25 +461,7 @@ def _kv_row(ws, row, label, value, number_format=None):
     return row + 1
 
 
-def _overdue_with_dpd(a: dict):
-    """
-    Overdue amount only when it's concurrent with a confirmed nonzero
-    last-reported DPD - mirrors deviation_checker.py's own overdue_dpd
-    signal (minus the loan-slab rupee threshold, which isn't known at
-    the account level). None (unreadable DPD) only matters when there's
-    actually an overdue balance to explain; a zero-overdue account is
-    confidently "not applicable" regardless of DPD readability.
-    """
-    overdue = a.get("overdue") or 0
-    if overdue <= 0:
-        return 0
-    dpd = a.get("last_reported_dpd")
-    if dpd is None:
-        return None
-    return overdue if dpd > 0 else 0
-
-
-def _build_credit_analysis_sheet(wb, analysis: dict, accounts: list) -> None:
+def _build_credit_analysis_sheet(wb, analysis: dict) -> None:
     ws = wb.create_sheet("Credit Analysis")
     for col, width in zip("ABCDEFGHI", (28, 20, 18, 18, 20, 20, 22, 18, 18)):
         ws.column_dimensions[col].width = width
@@ -605,40 +587,6 @@ def _build_credit_analysis_sheet(wb, analysis: dict, accounts: list) -> None:
             if col_idx == 3:
                 c.number_format = '#,##0'
                 c.alignment = _a("right")
-        row += 1
-
-    # ── DPD Detail: per-account view of the 3 signals the Deviation
-    #    Approval Checker's "Overdue with DPD" / ">90 DPD in last 12
-    #    months" / "Last reported DPD" parameters are computed from -
-    #    None (unreadable) rendered as "NA", not a silent blank/zero.
-    row = _section_header(ws, row, "DPD Detail - Deviation Approval Signals (All Accounts)")
-    for col_idx, h in enumerate(
-        ["Sr.No", "Overdue (Rs.)", "Overdue with DPD (Rs.)", "Max DPD (12mo)", "Last Reported DPD"], 1
-    ):
-        c = ws.cell(row=row, column=col_idx, value=h)
-        c.font = _f(bold=True, color=NAVY)
-        c.fill = _fill(LIGHT_GREY)
-        c.border = _b()
-    row += 1
-
-    for a in accounts:
-        cells = [
-            a.get("sr_no"),
-            a.get("overdue"),
-            _overdue_with_dpd(a),
-            a.get("max_dpd_12mo"),
-            a.get("last_reported_dpd"),
-        ]
-        for col_idx, v in enumerate(cells, 1):
-            c = ws.cell(row=row, column=col_idx, value=v if v is not None else "NA")
-            c.border = _b()
-            if col_idx >= 2:
-                c.alignment = _a("right")
-                if v is not None:
-                    c.number_format = '#,##0'
-        row += 1
-    if not accounts:
-        ws.cell(row=row, column=1, value="No accounts").font = _f(italic=True)
         row += 1
 
     ws.freeze_panes = "A2"

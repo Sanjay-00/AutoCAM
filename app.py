@@ -18,7 +18,6 @@ from parser import (
     METHOD_OCR, METHOD_VISION,
 )
 from excel_generator import generate_excel, get_filename
-from deviation_checker import evaluate_deviation
 
 st.set_page_config(
     page_title="AutoCAM  -  CIBIL",
@@ -184,24 +183,6 @@ _CHECK_CIBIL = "Check CIBIL"
 def _amt(v):
     """Return value as-is if numeric, or 'Check CIBIL' sentinel if None."""
     return _CHECK_CIBIL if v is None else v
-
-def _overdue_with_dpd(a: dict):
-    """
-    Overdue amount only when it's concurrent with a confirmed nonzero
-    last-reported DPD - mirrors deviation_checker.py's own overdue_dpd
-    signal (minus the loan-slab rupee threshold, which isn't known at
-    the account-table level). None (unreadable DPD) only matters when
-    there's actually an overdue balance to explain; a zero-overdue
-    account is confidently "not applicable" regardless of DPD readability.
-    """
-    overdue = a.get("overdue") or 0
-    if overdue <= 0:
-        return 0
-    dpd = a.get("last_reported_dpd")
-    if dpd is None:
-        return None
-    return overdue if dpd > 0 else 0
-
 
 def _status_display(a: dict) -> str:
     # CRIF Commercial only: Delinquent/Suit Filed are independent overlay
@@ -514,121 +495,6 @@ if data["extraction_method"] == METHOD_OCR:
         "grid has tiny digits that OCR can misread. Verify against the PDF for any "
         "delinquent (non-zero DPD) account before relying on it."
     )
-
-# ── Deviation Approval Checker (CV Policy Annexure-IV, p.16) ───────
-st.divider()
-st.markdown("#### 🛂 Deviation Approval Checker")
-st.caption(
-    "Checks the extracted bureau data against CV Policy Annexure-IV "
-    "(Bureau Validation). Manually verify any account flagged for the "
-    "written-off >3-year carve-out - the policy leaves that to judgment."
-)
-dev_col1, dev_col2, dev_col3 = st.columns(3)
-with dev_col1:
-    vehicle_category = st.selectbox(
-        "Vehicle Category",
-        options=["cv_pv_ce_machinery", "private_car"],
-        format_func=lambda v: "CV / PV / CE / Machinery" if v == "cv_pv_ce_machinery" else "Private Car",
-        key="dev_vehicle_category",
-    )
-with dev_col2:
-    entity_type = st.selectbox(
-        "Entity Type",
-        options=["individual", "non_individual"],
-        format_func=lambda v: "Individual" if v == "individual" else "Non-Individual",
-        key="dev_entity_type",
-    )
-with dev_col3:
-    loan_amount = st.number_input(
-        "Loan Amount (₹)", min_value=0, step=10_000, value=0, key="dev_loan_amount",
-    )
-
-if loan_amount > 0:
-    verdict = evaluate_deviation(data, loan_amount, vehicle_category, entity_type)
-    if verdict["overall_approval"]:
-        st.error(f"⚠️  Deviation required - **{verdict['overall_approval']}** approval "
-                 f"(matched slab: {verdict['slab']})")
-    elif verdict["incomplete"]:
-        st.warning(
-            "⚠️ Deviation check incomplete - some data could not be verified "
-            f"(matched slab: {verdict['slab']}). See the ❓ parameters below."
-        )
-    else:
-        st.success(f"✅  No deviation required (matched slab: {verdict['slab']})")
-
-    _PARAM_LABELS = {
-        "score": "Score", "overdue_dpd": "Overdue with DPD",
-        "dpd_12mo": ">90 DPD in last 12 months", "last_dpd": "Last reported DPD",
-        "written_off": "Written-off / Suit Filed / Settled / Loss",
-    }
-    _STATUS_ICON = {"pass": "✅", "fail": "❌", "info_only": "ℹ️",
-                     "unable_to_verify": "❓", "not_applicable": "⬜"}
-    # threshold_desc has no exact rupee/day figure plumbed through from the
-    # matched slab (evaluate_deviation doesn't expose it) - describes the
-    # rule being checked, not its numeric threshold.
-    _BREACH_THRESHOLD_DESC = {
-        "overdue_dpd": "overdue amount with concurrent DPD",
-        "dpd_12mo": ">90 DPD within the trailing 12 months",
-        "last_dpd": ">30 days DPD (most recent reported month)",
-        "written_off": "Written-off / Suit Filed / Settled / Loss",
-    }
-
-    def _srnos(accounts):
-        return ", ".join(str(a.get("sr_no")) for a in accounts)
-
-    def _remark(key: str, p: dict) -> str:
-        status = p["status"]
-        if status == "not_applicable":
-            return "N/A — all accounts excluded"
-        if key == "score":
-            if status == "info_only":
-                return f"Risk Rank {p['value']} — no CMR equivalent for CRIF Commercial, not evaluated"
-            if status == "unable_to_verify":
-                return "Score unreadable"
-            cmp = "meets" if status == "pass" else "below"
-            return f"{p['value']} {cmp} threshold {p['threshold']}"
-        breaching = p.get("breaching_accounts") or []
-        unreadable = p.get("unreadable_accounts") or []
-        if status == "fail":
-            return f"{len(breaching)} account(s) breach {_BREACH_THRESHOLD_DESC[key]} — Sr.No: {_srnos(breaching)}"
-        if status == "unable_to_verify":
-            return f"{len(unreadable)} account(s) unreadable — Sr.No: {_srnos(unreadable)}"
-        return "No breach"
-
-    _rows = []
-    for key, label in _PARAM_LABELS.items():
-        p = verdict["parameters"][key]
-        _rows.append({
-            "Parameter": label,
-            "Status": f"{_STATUS_ICON[p['status']]} {p['status']}",
-            "Remark": _remark(key, p),
-            "Escalation Approval": p.get("authority") or "—",
-        })
-    st.dataframe(pd.DataFrame(_rows), width="stretch", hide_index=True)
-
-    written_off_review = verdict["parameters"]["written_off"].get("manual_review")
-    if written_off_review:
-        st.caption(
-            "🔎 Manually check if any of Sr.No " + _srnos(written_off_review) +
-            " are >3 years old from application date with otherwise-good "
-            "running repayment - policy allows a carve-out."
-        )
-
-    if verdict["excluded_accounts"]:
-        with st.expander(f"Excluded from check ({len(verdict['excluded_accounts'])} account(s))"):
-            for a in verdict["excluded_accounts"]:
-                st.caption(f"Sr.No {a.get('sr_no')}: {a['exclusion_reason']}")
-
-    with st.expander(f"DPD Detail (all {len(accounts)} account(s))"):
-        st.dataframe(pd.DataFrame([{
-            "Sr.No":             a.get("sr_no"),
-            "Overdue (₹)":       a.get("overdue"),
-            "Overdue with DPD":  _amt(_overdue_with_dpd(a)),
-            "Max DPD (12mo)":    _amt(a.get("max_dpd_12mo")),
-            "Last Reported DPD": _amt(a.get("last_reported_dpd")),
-        } for a in accounts]), width="stretch", hide_index=True)
-else:
-    st.caption("Enter a loan amount above to run the deviation check.")
 
 # ── Credit Analysis  (CRIF Retail + Commercial - shapes differ)  ───
 analysis = data.get("analysis")
