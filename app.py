@@ -185,6 +185,24 @@ def _amt(v):
     """Return value as-is if numeric, or 'Check CIBIL' sentinel if None."""
     return _CHECK_CIBIL if v is None else v
 
+def _overdue_with_dpd(a: dict):
+    """
+    Overdue amount only when it's concurrent with a confirmed nonzero
+    last-reported DPD - mirrors deviation_checker.py's own overdue_dpd
+    signal (minus the loan-slab rupee threshold, which isn't known at
+    the account-table level). None (unreadable DPD) only matters when
+    there's actually an overdue balance to explain; a zero-overdue
+    account is confidently "not applicable" regardless of DPD readability.
+    """
+    overdue = a.get("overdue") or 0
+    if overdue <= 0:
+        return 0
+    dpd = a.get("last_reported_dpd")
+    if dpd is None:
+        return None
+    return overdue if dpd > 0 else 0
+
+
 def _status_display(a: dict) -> str:
     # CRIF Commercial only: Delinquent/Suit Filed are independent overlay
     # flags on top of the canonical status (Active/Closed/Written Off/
@@ -211,8 +229,6 @@ def _to_df(accounts: list) -> pd.DataFrame:
         "Ownership":        a.get("ownership", ""),
         "Type of Loan":     a["type_of_loan"],
         "Max DPD":          _amt(a["max_dpd"]),
-        "Max DPD (12mo)":   _amt(a.get("max_dpd_12mo")),
-        "Last Reported DPD": _amt(a.get("last_reported_dpd")),
         "Status":           _status_display(a),
     } for a in accounts])
 
@@ -242,8 +258,6 @@ _COL_CFG = {
     "Ownership":        st.column_config.TextColumn(  "Ownership",         width="small"),
     "Type of Loan":     st.column_config.TextColumn(  "Type of Loan"),
     "Max DPD":          st.column_config.TextColumn(  "Max DPD",           width="small"),
-    "Max DPD (12mo)":   st.column_config.TextColumn(  "Max DPD (12mo)",    width="small"),
-    "Last Reported DPD": st.column_config.TextColumn( "Last Reported DPD", width="small"),
     "Status":           st.column_config.TextColumn(  "Status",            width="small"),
 }
 
@@ -604,6 +618,15 @@ if loan_amount > 0:
         with st.expander(f"Excluded from check ({len(verdict['excluded_accounts'])} account(s))"):
             for a in verdict["excluded_accounts"]:
                 st.caption(f"Sr.No {a.get('sr_no')}: {a['exclusion_reason']}")
+
+    with st.expander(f"DPD Detail (all {len(accounts)} account(s))"):
+        st.dataframe(pd.DataFrame([{
+            "Sr.No":             a.get("sr_no"),
+            "Overdue (₹)":       a.get("overdue"),
+            "Overdue with DPD":  _amt(_overdue_with_dpd(a)),
+            "Max DPD (12mo)":    _amt(a.get("max_dpd_12mo")),
+            "Last Reported DPD": _amt(a.get("last_reported_dpd")),
+        } for a in accounts]), width="stretch", hide_index=True)
 else:
     st.caption("Enter a loan amount above to run the deviation check.")
 
