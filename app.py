@@ -543,28 +543,58 @@ if loan_amount > 0:
         "dpd_12mo": ">90 DPD in last 12 months", "last_dpd": "Last reported DPD",
         "written_off": "Written-off / Suit Filed / Settled / Loss",
     }
+    _STATUS_ICON = {"pass": "✅", "fail": "❌", "info_only": "ℹ️",
+                     "unable_to_verify": "❓", "not_applicable": "⬜"}
+    # threshold_desc has no exact rupee/day figure plumbed through from the
+    # matched slab (evaluate_deviation doesn't expose it) - describes the
+    # rule being checked, not its numeric threshold.
+    _BREACH_THRESHOLD_DESC = {
+        "overdue_dpd": "overdue amount with concurrent DPD",
+        "dpd_12mo": ">90 DPD within the trailing 12 months",
+        "last_dpd": ">30 days DPD (most recent reported month)",
+        "written_off": "Written-off / Suit Filed / Settled / Loss",
+    }
+
+    def _srnos(accounts):
+        return ", ".join(str(a.get("sr_no")) for a in accounts)
+
+    def _remark(key: str, p: dict) -> str:
+        status = p["status"]
+        if status == "not_applicable":
+            return "N/A — all accounts excluded"
+        if key == "score":
+            if status == "info_only":
+                return f"Risk Rank {p['value']} — no CMR equivalent for CRIF Commercial, not evaluated"
+            if status == "unable_to_verify":
+                return "Score unreadable"
+            cmp = "meets" if status == "pass" else "below"
+            return f"{p['value']} {cmp} threshold {p['threshold']}"
+        breaching = p.get("breaching_accounts") or []
+        unreadable = p.get("unreadable_accounts") or []
+        if status == "fail":
+            return f"{len(breaching)} account(s) breach {_BREACH_THRESHOLD_DESC[key]} — Sr.No: {_srnos(breaching)}"
+        if status == "unable_to_verify":
+            return f"{len(unreadable)} account(s) unreadable — Sr.No: {_srnos(unreadable)}"
+        return "No breach"
+
+    _rows = []
     for key, label in _PARAM_LABELS.items():
         p = verdict["parameters"][key]
-        icon = {"pass": "✅", "fail": "❌", "info_only": "ℹ️", "unable_to_verify": "❓", "not_applicable": "⬜"}[p["status"]]
-        line = f"{icon} **{label}**: {p['status']}"
-        if p.get("authority"):
-            line += f" → **{p['authority']}** approval"
-        st.markdown(line)
-        breaching = p.get("breaching_accounts")
-        # Only render breaching_accounts on an actual failure - a "pass"
-        # status can still carry sub-threshold accounts (e.g. overdue_dpd's
-        # 1-30 day tier, kept for bookkeeping) and showing them under a
-        # ✅ pass line reads as self-contradictory (Finding 5).
-        if breaching and p["status"] == "fail":
-            st.caption("Accounts: " + ", ".join(str(a.get("sr_no")) for a in breaching))
-        unreadable = p.get("unreadable_accounts")
-        if unreadable:
-            st.caption("Unreadable: " + ", ".join(str(a.get("sr_no")) for a in unreadable))
-        if key == "written_off" and p.get("manual_review"):
-            st.caption(
-                "🔎 Manually check if any of these are >3 years old from application "
-                "date with otherwise-good running repayment - policy allows a carve-out."
-            )
+        _rows.append({
+            "Parameter": label,
+            "Status": f"{_STATUS_ICON[p['status']]} {p['status']}",
+            "Remark": _remark(key, p),
+            "Escalation Approval": p.get("authority") or "—",
+        })
+    st.dataframe(pd.DataFrame(_rows), width="stretch", hide_index=True)
+
+    written_off_review = verdict["parameters"]["written_off"].get("manual_review")
+    if written_off_review:
+        st.caption(
+            "🔎 Manually check if any of Sr.No " + _srnos(written_off_review) +
+            " are >3 years old from application date with otherwise-good "
+            "running repayment - policy allows a carve-out."
+        )
 
     if verdict["excluded_accounts"]:
         with st.expander(f"Excluded from check ({len(verdict['excluded_accounts'])} account(s))"):
