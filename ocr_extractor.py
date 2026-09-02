@@ -397,7 +397,7 @@ import re as _re
 
 
 _DPD_PAGE_PROMPT = """\
-This page is from a CRIF High Mark COMMERCIAL ACE credit report.
+This page is from a CRIF High Mark credit report (Retail or Commercial ACE).
 The Payment History/Asset Classification table cells come in TWO different formats depending \
 on the report - check which one this page actually uses before answering:
 
@@ -419,16 +419,22 @@ coloured Format-A cell comes out <= 30, look again. Under FORMAT B, colour inste
 non-STD code (SM0/SM1/SM2/SUB/DBT/LOS) - it does not imply any specific number itself, use the code \
 lookup above.
 
-For EACH account listed below (identified by Sanctioned Date and Sanctioned Amount), find its \
-Payment History grid, determine which format it uses, and return the MAXIMUM resulting DPD value \
-across all months (Format A: highest NNN read; Format B: representative value of the worst code seen).
+For EACH numbered account listed below, find its Payment History grid, determine which format it \
+uses, and return the MAXIMUM resulting DPD value across all months (Format A: highest NNN read; \
+Format B: representative value of the worst code seen).
 
-Accounts on this page:
+Accounts on this page, listed in TOP-TO-BOTTOM order as they appear on the page - sibling accounts \
+(e.g. the same guarantor obligation split across several loans) commonly share an identical \
+Sanctioned Date and Sanctioned Amount, so Current Balance and top-to-bottom position are the only \
+reliable way to tell them apart; match each numbered item to its OWN account block by position, \
+never by re-using the same block for two different numbers:
 {account_list}
 
-Return ONLY a JSON object mapping each "DATE|AMOUNT" key to its max DPD integer:
-{{"DD-MM-YYYY|AMOUNT": 33, "DD-MM-YYYY|AMOUNT": 546}}
-Use 0 if the account's history is all STD/000 or not found. No other text.\
+Return ONLY a JSON array of {n} values, one per listed account IN THE SAME ORDER (item 1 first, \
+item 2 second, ...) - not an object, not keyed by date or amount, since numbers repeat:
+[33, 546, 0]
+Use 0 for an account whose history is all STD/000, or null if that account's own grid genuinely \
+cannot be found on this page. No other text.\
 """
 
 
@@ -437,28 +443,60 @@ def _strip_json(text: str) -> str:
     return _re.sub(r'\s*```$', '', text).strip()
 
 
+def _extract_json_array(text: str) -> str:
+    """
+    Pull the JSON array out of a response even when the model ignored "no
+    other text" and reasoned in prose first (confirmed common: 3 of 4 real
+    calls did this) - the array is a flat list of scalars (numbers/null) with
+    no nesting, so the LAST bracket-delimited '[...]' in the text is the
+    answer (any earlier one would be reasoning-text noise, never the final
+    array, since the model states its per-account reasoning before the array).
+    Falls back to the raw text unchanged if no bracket pair is found, so
+    json.loads() below still gets a clear error to fail on.
+    """
+    matches = _re.findall(r'\[[^\[\]]*\]', text)
+    return matches[-1] if matches else text
+
+
 def vision_extract_dpd_from_uri(img_uri: str, accounts: list,
-                                api_key: str, invoke_fn) -> dict:
+                                api_key: str, invoke_fn) -> list:
     """
     Ask Gemini to read max DPD for accounts using a pre-rendered page image URI.
     Separated from rendering so callers can parallelise the API calls while keeping
     PyMuPDF rendering on the main thread (MuPDF is not thread-safe).
-    Returns {"{date}|{amount}": dpd_int}.
+
+    Matched by POSITION, not by a "date|amount" content key: CRIF commonly prints
+    sibling accounts (a guarantor obligation split across several loans) with an
+    identical Sanctioned Date AND Sanctioned Amount, so a content key can't tell
+    them apart - two such accounts would collide onto the same dict entry and
+    silently share one (possibly wrong) DPD value. Position is unambiguous because
+    `accounts` is already in the same top-to-bottom document order the prompt
+    describes and asks Gemini to preserve.
+
+    Returns a list the same length as `accounts`, each element the resolved DPD
+    int or None if Gemini couldn't find/resolve that item.
     """
-    keys = [f"{a['date_of_sanction']}|{a.get('sanction_amount', 0)}" for a in accounts]
-    account_list = "\n".join(f"- {k}" for k in keys)
+    lines = []
+    for i, a in enumerate(accounts, 1):
+        bal = a.get("current_balance")
+        bal_part = f", Current Balance: {bal:,}" if bal is not None else ""
+        lines.append(
+            f"{i}. Sanctioned Date: {a['date_of_sanction']}, "
+            f"Sanctioned Amount: {a.get('sanction_amount', 0):,}{bal_part}"
+        )
+    account_list = "\n".join(lines)
     content = [
-        {"type": "text", "text": _DPD_PAGE_PROMPT.format(account_list=account_list)},
+        {"type": "text", "text": _DPD_PAGE_PROMPT.format(account_list=account_list, n=len(accounts))},
         {"type": "image_url", "image_url": img_uri},
     ]
     try:
         raw    = invoke_fn(api_key, content)
-        parsed = json.loads(_strip_json(raw))
-        if isinstance(parsed, dict):
-            return {k: int(float(str(v))) for k, v in parsed.items()}
+        parsed = json.loads(_extract_json_array(_strip_json(raw)))
+        if isinstance(parsed, list) and len(parsed) == len(accounts):
+            return [None if v is None else int(float(str(v))) for v in parsed]
     except Exception:
         pass
-    return {}
+    return [None] * len(accounts)
 
 
 def vision_extract_accounts(doc, page_indices: list, api_key: str,
