@@ -1,6 +1,27 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from crif_parser import _extract_dpd_window
+from crif_parser import _extract_dpd_window, _extract_max_dpd
+
+
+def test_last_account_blank_grid_not_corrupted_by_trailing_report_text():
+    # The report's LAST account has no next "Account Information" header to
+    # bound its block, so a genuinely blank Payment History section can run
+    # on into the document-level Inquiries section, "-END OF REPORT-", and
+    # the Appendix/glossary - all digit-heavy, which used to fool the
+    # digit-density "blank vs. garbled" heuristic into reporting a
+    # confidently-blank account as unreadable (confirmed on a real report).
+    block = (
+        "Account Information\n47\n  Ownership:\nINDIVIDUAL\n"
+        "Current Balance:\n0\nClosed Date:\n29-01-2023\n"
+        "Payment History/Asset Classification:\n"
+        "Inquiries ( past 24 months)\nCredit Grantor\nType\nDate of Inquiry\n"
+        "Account Type\nAmount\nXXXX\nNBF\n16-07-2026\nConsumer Loan\n15,000\n"
+        "XXXX\nHFC\n02-04-2026\nOTHER\n3,00,000\n"
+        "-END OF REPORT-\nAppendix\nSection\nCode\nDescription\n"
+        "8/17/26, 5:43 PM\n"
+    )
+    assert _extract_max_dpd(block) == 0
+    assert _extract_dpd_window(block) == (0, 0)
 
 def test_single_year_partial_grid_last_reported_is_rightmost_populated():
     # 875 (not the disputed 900 boundary - see Finding 7 of the whole-branch

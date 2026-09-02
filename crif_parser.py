@@ -710,6 +710,32 @@ def _letter_placeholder_dpd(region: str):
     return max(vals) if vals else None
 
 
+_BLOCK_END_MARKERS_RE = re.compile(
+    r'-END OF REPORT-|\nAppendix\n|\nInquiries\s*\(', re.IGNORECASE
+)
+
+
+def _payment_history_region(block: str) -> str:
+    """
+    The text from 'Payment History' to the end of the block - trimmed at
+    the document-level 'Inquiries (past N months)' section, the
+    end-of-report marker, or 'Appendix', whichever comes first. Only the
+    report's LAST account has no next 'Account Information' header to
+    bound its block, so its captured text can run on into all three -
+    each digit-heavy (inquiry dates/amounts, timestamps, page numbers),
+    which fooled the digit-density "genuinely blank vs. garbled"
+    heuristic below into reporting a confidently-blank account as
+    unreadable (confirmed on a real report: a small, already-closed loan
+    with a genuinely empty Payment History section, misread as
+    unable_to_verify solely because of this trailing document-level text
+    bleeding into its block).
+    """
+    m = re.search(r'Payment\s+History', block, re.IGNORECASE)
+    region = block[m.end():] if m else block
+    end_m = _BLOCK_END_MARKERS_RE.search(region)
+    return region[:end_m.start()] if end_m else region
+
+
 def _extract_max_dpd(block: str):
     # DPD grid cells are "NNN/AssetClass" (e.g. 027/XXX). OCR mangles them two ways:
     #   - the days value loses leading zeros, so it can be 1-3 digits ('24/XXX');
@@ -718,8 +744,7 @@ def _extract_max_dpd(block: str):
     # Accept a 2-3 LETTER class (covers XXX/STD/SMA/... and garbles like KXX) but
     # reject digit-only tokens ('200/200') and frequency words ('400/Monthly'), which
     # would otherwise fabricate DPD from EMI amounts and '000'→'200' misreads.
-    m      = re.search(r'Payment\s+History', block, re.IGNORECASE)
-    region = block[m.end():] if m else block
+    region = _payment_history_region(block)
     vals   = [
         int(num)
         for num, cls in re.findall(r'(?<!\d)(\d{1,3})\s*/\s*([A-Za-z]{2,3})', region)
@@ -790,8 +815,7 @@ def _extract_dpd_window(block: str):
 
     Returns (None, None) if no grid data could be read at all.
     """
-    m = re.search(r'Payment\s+History', block, re.IGNORECASE)
-    region = block[m.end():] if m else block
+    region = _payment_history_region(block)
     year_matches = list(_YEAR_RE.finditer(region))
     if not year_matches:
         # No recognisable year label at all. Mirror _extract_max_dpd's own
