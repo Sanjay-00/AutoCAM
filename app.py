@@ -353,6 +353,13 @@ if uploaded and run:
     st.session_state["data"]        = data
     st.session_state["data_key"]    = file_key
     st.session_state["excel_bytes"] = None  # stale - regenerated below on next use
+    # dev_loan_amount otherwise persists from whatever the analyst typed for a
+    # PREVIOUS report (Streamlit widget state survives across reruns once
+    # set, ignoring the widget's own value= default) - a fresh report needs
+    # its own loan amount re-entered, not a silently carried-over figure from
+    # an unrelated borrower matching the wrong policy slab (confirmed on a
+    # real report: ">50L" matched by default from a prior session's amount).
+    st.session_state["dev_loan_amount"] = 0
 
 data = st.session_state.get("data")
 if data is None or file_key is None or st.session_state.get("data_key") != file_key:
@@ -521,9 +528,21 @@ st.markdown("#### 🛂 Deviation Approval Checker")
 st.caption(
     "Checks the extracted bureau data against CV Policy Annexure-IV "
     "(Bureau Validation). Manually verify any account flagged for the "
-    "written-off >3-year carve-out - the policy leaves that to judgment."
+    "written-off >3-year carve-out; the policy leaves that to judgment."
 )
-dev_col1, dev_col2, dev_col3 = st.columns(3)
+# Entity type is derived from the report's own provider, not asked. The
+# provider already settles it within this app's scope: CRIF Retail is
+# always a personal 300-900 score report (Individual, including
+# proprietors, since they carry personal liability on a Retail-format
+# report), CRIF Commercial ACE is always a company/commercial risk-rank
+# report (no personal score at all), and TransUnion here only ever parses
+# commercial/company reports (tu_parser.py has no individual/consumer TU
+# support).
+_ENTITY_TYPE_BY_PROVIDER = {"crif": "individual", "crif_commercial": "non_individual",
+                            "transunion": "non_individual"}
+entity_type = _ENTITY_TYPE_BY_PROVIDER.get(data.get("provider"), "individual")
+
+dev_col1, dev_col2 = st.columns(2)
 with dev_col1:
     vehicle_category = st.selectbox(
         "Vehicle Category",
@@ -532,29 +551,24 @@ with dev_col1:
         key="dev_vehicle_category",
     )
 with dev_col2:
-    entity_type = st.selectbox(
-        "Entity Type",
-        options=["individual", "non_individual"],
-        format_func=lambda v: "Individual" if v == "individual" else "Non-Individual",
-        key="dev_entity_type",
-    )
-with dev_col3:
     loan_amount = st.number_input(
         "Loan Amount (₹)", min_value=0, step=10_000, value=0, key="dev_loan_amount",
     )
+st.caption(f"Entity Type: **{'Individual' if entity_type == 'individual' else 'Non-Individual'}** "
+           f"(auto-detected from the report's provider)")
 
 if loan_amount > 0:
     verdict = evaluate_deviation(data, loan_amount, vehicle_category, entity_type)
     if verdict["overall_approval"]:
-        st.error(f"⚠️  Deviation required - **{verdict['overall_approval']}** approval "
+        st.error(f"⚠️ Deviation required: **{verdict['overall_approval']}** approval "
                  f"(matched slab: {verdict['slab']})")
     elif verdict["incomplete"]:
         st.warning(
-            "⚠️ Deviation check incomplete - some data could not be verified "
-            f"(matched slab: {verdict['slab']}). See the ❓ parameters below."
+            f"⚠️ Deviation check incomplete: some data could not be verified "
+            f"(matched slab: {verdict['slab']}). See the flagged parameters below."
         )
     else:
-        st.success(f"✅  No deviation required (matched slab: {verdict['slab']})")
+        st.success(f"✅ No deviation required (matched slab: {verdict['slab']})")
 
     _PARAM_LABELS = {
         "score": "Score", "overdue_dpd": "Overdue with DPD",
@@ -563,55 +577,137 @@ if loan_amount > 0:
     }
     _STATUS_ICON = {"pass": "✅", "fail": "❌", "info_only": "ℹ️",
                      "unable_to_verify": "❓", "not_applicable": "⬜"}
-    # threshold_desc has no exact rupee/day figure plumbed through from the
-    # matched slab (evaluate_deviation doesn't expose it) - describes the
-    # rule being checked, not its numeric threshold.
-    _BREACH_THRESHOLD_DESC = {
-        "overdue_dpd": "overdue amount with concurrent DPD",
-        "dpd_12mo": ">90 DPD within the trailing 12 months",
-        "last_dpd": ">30 days DPD (most recent reported month)",
-        "written_off": "Written-off / Suit Filed / Settled / Loss",
-    }
 
     def _srnos(accounts):
         return ", ".join(str(a.get("sr_no")) for a in accounts)
 
-    def _remark(key: str, p: dict) -> str:
+    _APPROVAL_TEXT = {
+        "pass": "Not required", "info_only": "Not applicable",
+        "not_applicable": "Not applicable", "unable_to_verify": "Manual review",
+    }
+
+    def _approval(p: dict) -> str:
+        authority = p.get("authority")
+        return authority if authority else _APPROVAL_TEXT[p["status"]]
+
+    def _written_off_reasons(a: dict) -> list:
+        # Mirrors deviation_checker.py's _written_off_hit signal-by-signal -
+        # that function only returns a bool, so the specific reason(s) are
+        # re-derived here purely for display.
+        reasons = []
+        if a.get("written_off"):
+            reasons.append("Written Off")
+        if a.get("status") in ("Written Off", "Settled"):
+            reasons.append(a["status"])
+        if a.get("suit_filed"):
+            reasons.append("Suit Filed")
+        if a.get("max_dpd_12mo") is not None and a.get("max_dpd_12mo") >= 181:
+            reasons.append("Loss")
+        seen = []
+        for r in reasons:
+            if r not in seen:
+                seen.append(r)
+        return seen or ["Flagged"]
+
+    def _value(key: str, p: dict) -> str:
         status = p["status"]
         if status == "not_applicable":
-            return "N/A — all accounts excluded"
+            return "N/A"
         if key == "score":
-            if status == "info_only":
-                return f"Risk Rank {p['value']} — no CMR equivalent for CRIF Commercial, not evaluated"
-            if status == "unable_to_verify":
-                return "Score unreadable"
-            cmp = "meets" if status == "pass" else "below"
-            return f"{p['value']} {cmp} threshold {p['threshold']}"
+            # threshold is None only for info_only (CRIF Commercial - no
+            # CMR equivalent, nothing to compare against); every other
+            # status (pass/fail/unable_to_verify) carries the real
+            # threshold that was actually applied, so show it.
+            threshold = p.get("threshold")
+            return f"{p.get('value')} (min {threshold})" if threshold is not None else str(p.get("value"))
         breaching = p.get("breaching_accounts") or []
-        unreadable = p.get("unreadable_accounts") or []
-        if status == "fail":
-            return f"{len(breaching)} account(s) breach {_BREACH_THRESHOLD_DESC[key]} — Sr.No: {_srnos(breaching)}"
-        if status == "unable_to_verify":
-            return f"{len(unreadable)} account(s) unreadable — Sr.No: {_srnos(unreadable)}"
-        return "No breach"
+        if key == "overdue_dpd":
+            # breaching_accounts here means "overdue with any nonzero DPD" -
+            # broader than what actually fails this parameter (DPD > 30
+            # days, the policy's own escalation floor). Shown either way
+            # (never hidden just because status is Pass), same compact
+            # shape regardless of which side of the threshold it lands on.
+            if status == "unable_to_verify":
+                unreadable = p.get("unreadable_accounts") or []
+                return f"Unreadable: Sr.No {_srnos(unreadable)}"
+            if breaching:
+                worst = max(breaching, key=lambda a: a.get("last_reported_dpd") or 0)
+                total = sum(a.get("overdue") or 0 for a in breaching)
+                return f"₹{total:,} overdue, {len(breaching)} account(s), worst DPD {worst.get('last_reported_dpd')} days"
+            return "No overdue breach"
+        if key in ("dpd_12mo", "last_dpd"):
+            field = "max_dpd_12mo" if key == "dpd_12mo" else "last_reported_dpd"
+            if breaching:
+                worst = max(breaching, key=lambda a: a.get(field) or 0)
+                return f"{worst.get(field)} days (Sr.No {worst.get('sr_no')})"
+            if status == "unable_to_verify":
+                unreadable = p.get("unreadable_accounts") or []
+                return f"Unreadable: Sr.No {_srnos(unreadable)}"
+            return "Clean"
+        if key == "written_off":
+            return f"{len(breaching)} account(s) flagged" if breaching else "None"
+        return ""
+
+    # Detail rows for the expander below - one row per (parameter, account),
+    # never a packed string, so a report with many breaching accounts (a real
+    # Commercial report showed 20 for overdue_dpd, 19 for written_off) can't
+    # truncate mid-cell the way a single joined string in the summary table
+    # would (confirmed on a real report).
+    _DETAIL_VALUE_FIELD = {
+        "overdue_dpd": "last_reported_dpd", "dpd_12mo": "max_dpd_12mo", "last_dpd": "last_reported_dpd",
+    }
+
+    def _detail_rows(key: str, p: dict) -> list:
+        rows = []
+        for a in p.get("breaching_accounts") or []:
+            if key == "overdue_dpd":
+                note = f"Overdue ₹{(a.get('overdue') or 0):,}, DPD {a.get('last_reported_dpd')}"
+            elif key in ("dpd_12mo", "last_dpd"):
+                note = f"{a.get(_DETAIL_VALUE_FIELD[key])} days"
+            elif key == "written_off":
+                note = ", ".join(_written_off_reasons(a))
+            else:
+                note = ""
+            # overdue_dpd's breaching_accounts includes sub-30-day DPD
+            # sightings that don't actually fail the parameter (see
+            # _value's comment above) - still shown, but labeled
+            # "Below threshold" rather than "Breach" so the account stays
+            # visible without implying a deviation was triggered.
+            reading = "Breach" if p["status"] == "fail" or key != "overdue_dpd" else "Below threshold"
+            rows.append({
+                "Parameter": _PARAM_LABELS[key], "Sr.No": a.get("sr_no"),
+                "Type of Loan": a.get("type_of_loan"), "Reading": reading, "Note": note,
+            })
+        for a in p.get("unreadable_accounts") or []:
+            rows.append({
+                "Parameter": _PARAM_LABELS[key], "Sr.No": a.get("sr_no"),
+                "Type of Loan": a.get("type_of_loan"), "Reading": "Unreadable", "Note": "",
+            })
+        return rows
 
     _rows = []
     for key, label in _PARAM_LABELS.items():
         p = verdict["parameters"][key]
         _rows.append({
             "Parameter": label,
-            "Status": f"{_STATUS_ICON[p['status']]} {p['status']}",
-            "Remark": _remark(key, p),
-            "Escalation Approval": p.get("authority") or "—",
+            "Value": _value(key, p),
+            "Status": f"{_STATUS_ICON[p['status']]} {p['status'].replace('_', ' ').title()}",
+            "Escalation Approval": _approval(p),
         })
     st.dataframe(pd.DataFrame(_rows), width="stretch", hide_index=True)
+
+    _detail = []
+    for key in _PARAM_LABELS:
+        _detail.extend(_detail_rows(key, verdict["parameters"][key]))
+    if _detail:
+        with st.expander(f"Breach and unreadable account detail ({len(_detail)} row(s))"):
+            st.dataframe(pd.DataFrame(_detail), width="stretch", hide_index=True)
 
     written_off_review = verdict["parameters"]["written_off"].get("manual_review")
     if written_off_review:
         st.caption(
-            "🔎 Manually check if any of Sr.No " + _srnos(written_off_review) +
-            " are >3 years old from application date with otherwise-good "
-            "running repayment - policy allows a carve-out."
+            f"🔎 Manually review {len(written_off_review)} written-off/settled account(s) "
+            f"for the >3 year carve-out (see the detail expander above for Sr.No)."
         )
 
     if verdict["excluded_accounts"]:
