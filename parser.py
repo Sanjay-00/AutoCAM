@@ -413,9 +413,9 @@ def _reattach_ownership(new_accounts: list, old_accounts: list) -> list:
     LLM/Vision correction and full re-extraction paths (_llm_fix_blocks,
     _llm_full, and CRIF Commercial's vision_extract_accounts) request their
     own field list from the model, which doesn't include `ownership` -
-    deviation_checker.py's Guarantor/Joint-capacity exclusion reads that
-    field, so silently dropping it re-enables a policy check the bureau
-    data itself says shouldn't apply. `ownership` is a bureau-formatting-
+    silently dropping it loses a real bureau-reported field (Guarantor/
+    Joint-capacity accounts becoming indistinguishable from Individual
+    ones after fallback correction). `ownership` is a bureau-formatting-
     derived field (parsed from fixed label text, not free-form prose) that
     an LLM correcting other fields has no reason to touch, so it's cheaper
     and lower-risk to reattach it from the pre-fallback rule-based
@@ -514,27 +514,56 @@ def _val_quality(v: dict) -> tuple:
 
 
 def _find_account_page(acc: dict, page_texts: list) -> int | None:
-    """Return the page index whose OCR text contains this account's sanction date."""
+    """
+    Return the page index holding this account's own Payment History grid.
+
+    Sanctioned Date alone is not a safe anchor - sibling accounts (a guarantor
+    obligation split across several loans) commonly share the same date, so a
+    plain "date in page text" search can return a DIFFERENT account's page
+    (confirmed on a real report: two guarantor CV loans sanctioned the same
+    day, one page apart - date-only lookup sent Vision the wrong page for the
+    second one, and it correctly reported the account "not found" there).
+    Current Balance is checked first because it's effectively unique per
+    account (unlike the date), comparing digit-only so Indian comma grouping
+    ("11,95,399") can't cause a formatting mismatch against page text. Falls
+    back to date-only when balance is unreadable ("Check CIBIL"/None) or not
+    found on any page.
+    """
     date = acc.get("date_of_sanction", "")
-    if not date or date == "NA":
-        return None
+    date_ok = bool(date and date != "NA")
+    bal = acc.get("current_balance")
+    bal_digits = re.sub(r'\D', '', str(bal)) if bal not in (None, "") else None
+
+    bal_only_match, date_only_match = None, None
     for pg_idx, pg_text in enumerate(page_texts):
-        if date in pg_text:
+        has_date = date_ok and date in pg_text
+        has_bal  = bal_digits and bal_digits in re.sub(r'\D', '', pg_text)
+        if has_date and has_bal:
             return pg_idx
-    return None
+        if has_bal and bal_only_match is None:
+            bal_only_match = pg_idx
+        if has_date and date_only_match is None:
+            date_only_match = pg_idx
+    # Balance alone is more specific than date alone (the field known to
+    # repeat across sibling accounts) - prefer it when neither page matched
+    # both fields together.
+    return bal_only_match if bal_only_match is not None else date_only_match
 
 
 def _enrich_dpd_vision(accounts: list, doc, page_texts: list, api_key: str,
                        on_progress=None) -> dict:
     """
-    For scanned CRIF Commercial PDFs, OCR cannot read text inside coloured
-    (orange/red) payment history cells, and _extract_max_dpd returns None for
-    accounts where it found no readable payment-history pattern at all (shown
-    as "Check CIBIL" rather than a possibly-wrong 0). This function sends each
-    affected page to Gemini Vision and resolves max_dpd on those None accounts.
-    Confident 0-DPD reads from OCR are left untouched - only genuinely unread
-    accounts are sent. Mutates accounts in-place; called only when
-    method != METHOD_VISION.
+    Shared by CRIF Commercial and CRIF Retail (both call this with their own
+    scanned/OCR'd accounts). For scanned PDFs, OCR cannot read text inside
+    coloured (orange/red) payment history cells, and each provider's own
+    _extract_max_dpd returns None for accounts where it found no readable
+    payment-history pattern at all (shown as "Check CIBIL" rather than a
+    possibly-wrong 0). This function sends each affected page to Gemini
+    Vision and resolves max_dpd on those None accounts. Confident 0-DPD
+    reads from OCR are left untouched - only genuinely unread accounts are
+    sent. Mutates accounts in-place; for Commercial, called only when
+    method != METHOD_VISION (Retail has no equivalent full-account Vision
+    fallback to have preempted this).
 
     Only pages that actually hold an unread (None) account are rendered and
     sent - not the whole document - to keep this fast and cheap.
@@ -597,17 +626,20 @@ def _enrich_dpd_vision(accounts: list, doc, page_texts: list, api_key: str,
             if on_progress:
                 on_progress(done_count, total)
             try:
-                pg_idx, dpd_map = fut.result()
+                pg_idx, dpd_list = fut.result()
             except Exception:
                 continue
-            for acc in page_map[pg_idx]:
-                key = f"{acc['date_of_sanction']}|{acc.get('sanction_amount') or 0}"
+            # Matched by position (dpd_list[i] answers page_map[pg_idx][i]),
+            # not by a date|amount key - sibling accounts (same guarantor
+            # obligation split across loans) commonly share both fields, so a
+            # content key would silently merge two different accounts' DPD.
+            for acc, dpd in zip(page_map[pg_idx], dpd_list):
                 # Accept whatever Gemini reports, including 0 - these accounts
                 # started as None (unread), so even a confirmed 0 resolves the
                 # uncertainty and is worth recording. Left as None (Check CIBIL)
-                # only if Gemini has no answer for this key at all.
-                if key in dpd_map:
-                    acc["max_dpd"] = dpd_map[key]
+                # only if Gemini had no answer for this position at all.
+                if dpd is not None:
+                    acc["max_dpd"] = dpd
                     summary["accounts_patched"].append(acc["sr_no"])
 
     summary["accounts_patched"].sort()
@@ -729,12 +761,14 @@ def parse(pdf_source, api_key: str = None, on_progress=None,
     structured data. Scanned PDFs are OCR'd first.
 
     on_progress(current_page, total_pages) is called during OCR if provided.
-    on_dpd_progress(done, total) is called during Vision DPD enrichment (CRIF
-    Commercial scanned only).
-    enrich_dpd: CRIF Commercial only, opt-in (default False). Rule-based OCR
-    is always tried first; Gemini is never called unless this is True - the
-    UI surfaces `vision_fallback_recommended` / `dpd_vision_recommended` in
-    the result so the user can decide whether to re-run with it enabled.
+    on_dpd_progress(done, total) is called during Vision DPD enrichment
+    (CRIF Commercial or Retail, scanned only).
+    enrich_dpd: opt-in (default False). Rule-based OCR is always tried first;
+    Gemini is never called unless this is True - the UI surfaces
+    `vision_fallback_recommended` (CRIF Commercial's full-account re-extract
+    only) / `dpd_vision_recommended` (CRIF Commercial and Retail's DPD-only
+    patch) in the result so the user can decide whether to re-run with it
+    enabled.
     HTML sources (.html/.htm) are supported too  -  they carry embedded text
     (like a digital PDF) with no OCR/Vision path, since there's no PDF page to
     render.
@@ -827,6 +861,25 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
                     extraction_method = METHOD_LLM_FULL
                     validation        = validate_extraction(accounts, reported, overdue_scope_all_accounts=True)
 
+    # DPD Vision enrichment - same opt-in mechanism and _enrich_dpd_vision
+    # helper as CRIF Commercial (see its docstring). Retail has no
+    # full-account Vision fallback (crif_parser's block-splitting/regex
+    # extraction is the only extraction path here, unlike Commercial's
+    # vision_extract_accounts) - this only patches the one field OCR left
+    # unreadable (max_dpd is None) on a badly garbled payment-history grid.
+    has_unread_dpd = any(a.get("max_dpd") is None for a in accounts)
+    dpd_vision_recommended = scanned and bool(api_key) and has_unread_dpd
+    dpd_vision_used         = False
+    dpd_vision_summary      = {"pages_sent": [], "accounts_checked": [], "accounts_patched": []}
+    if enrich_dpd and dpd_vision_recommended and page_texts:
+        dpd_vision_used    = True
+        dpd_vision_summary = _enrich_dpd_vision(accounts, doc, page_texts, api_key,
+                                                on_progress=on_dpd_progress)
+        # A patched max_dpd doesn't move the balance/sanction/overdue checks,
+        # but validate_extraction's dpd-vs-overdue contradiction check reads
+        # max_dpd directly, so it needs to be recomputed off the final values.
+        validation = validate_extraction(accounts, reported, overdue_scope_all_accounts=True)
+
     return {
         "name":              name,
         "score":             score,
@@ -835,6 +888,11 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
         "validation":        validation,
         "provider":          "crif",
         "tesseract_version": ocr_extractor.tesseract_version() if scanned else None,
+        "dpd_vision_recommended": dpd_vision_recommended,
+        "dpd_vision_used":        dpd_vision_used,
+        "dpd_vision_pages":       dpd_vision_summary["pages_sent"],
+        "dpd_vision_checked":     dpd_vision_summary["accounts_checked"],
+        "dpd_vision_patched":     dpd_vision_summary["accounts_patched"],
         "analysis": {
             "credit_profile_summary": crif_credit_profile_summary(accounts),
             "derog_summary":          crif_derog_summary(accounts),
