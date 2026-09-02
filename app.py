@@ -211,6 +211,8 @@ def _to_df(accounts: list) -> pd.DataFrame:
         "Ownership":        a.get("ownership", ""),
         "Type of Loan":     a["type_of_loan"],
         "Max DPD":          _amt(a["max_dpd"]),
+        "Max DPD (12mo)":   _amt(a.get("max_dpd_12mo")),
+        "Last Reported DPD": _amt(a.get("last_reported_dpd")),
         "Status":           _status_display(a),
     } for a in accounts])
 
@@ -240,6 +242,8 @@ _COL_CFG = {
     "Ownership":        st.column_config.TextColumn(  "Ownership",         width="small"),
     "Type of Loan":     st.column_config.TextColumn(  "Type of Loan"),
     "Max DPD":          st.column_config.TextColumn(  "Max DPD",           width="small"),
+    "Max DPD (12mo)":   st.column_config.TextColumn(  "Max DPD (12mo)",    width="small"),
+    "Last Reported DPD": st.column_config.TextColumn( "Last Reported DPD", width="small"),
     "Status":           st.column_config.TextColumn(  "Status",            width="small"),
 }
 
