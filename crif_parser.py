@@ -805,6 +805,9 @@ def _extract_dpd_window(block: str):
     (most-recent-first) to derive:
       - last_reported_dpd: the most recently populated month's DPD
       - max_dpd_12mo: the worst DPD across the trailing 12 populated months
+      - max_dpd_alltime: the worst DPD across the entire visible grid,
+        preferred over _extract_max_dpd's flat whole-block scan when
+        available (see why below)
 
     CRIF prints year blocks most-recent-year-first, each with 12 month
     cells left-to-right (Jan..Dec); reading a year block's cells in
@@ -813,7 +816,29 @@ def _extract_dpd_window(block: str):
     year label marks a stale duplicate grid (seen on a real corrupted/
     merged block) and stops the scan.
 
-    Returns (None, None) if no grid data could be read at all.
+    calendar_positions counts actual non-blank calendar months walked -
+    this drives where the 12-month boundary falls, not the count of
+    resolved values. A real report confirmed why: a cell like "XXX/XXX"
+    (present, but not a recognised classification - _cell_to_dpd returns
+    None for it) was being skipped without counting, so the walk reached
+    into a 13th+ calendar month to make up the difference, silently
+    widening the 12-month window (the same class of bug independently
+    found and fixed on the CRIF Commercial ACE side of this codebase).
+    Blank ('-') cells are the only thing skipped without counting - they
+    mean no data that month, not "data present but unclassified".
+
+    max_dpd_alltime exists because _extract_max_dpd only falls back to a
+    letter-placeholder ('XXX/SUB' etc) reading when NO numeric cell exists
+    anywhere in the block at all - so a block with a mix of real numeric
+    readings AND a worse letter-placeholder reading (e.g. one month shows
+    'XXX/SUB' - Substandard, no exact day-count printed - while other
+    months show low numeric DPD) silently reports only the numeric max,
+    missing the more severe classification entirely (confirmed on a real
+    report: an account with a genuine 'XXX/SUB' reading and a numeric max
+    of 27 reported max_dpd=27, when the true worst reading was 91 - the
+    Substandard bucket's representative value).
+
+    Returns (None, None, None) if no grid data could be read at all.
     """
     region = _payment_history_region(block)
     year_matches = list(_YEAR_RE.finditer(region))
@@ -821,18 +846,18 @@ def _extract_dpd_window(block: str):
         # No recognisable year label at all. Mirror _extract_max_dpd's own
         # digit-density heuristic: a genuinely blank grid (brand new
         # account, no history yet) has almost no digits in this region, so
-        # that's a confident (0, 0) - not "unreadable". A digit-dense region
-        # with no year label we could parse is genuinely garbled, and stays
-        # (None, None).
+        # that's a confident (0, 0, 0) - not "unreadable". A digit-dense
+        # region with no year label we could parse is genuinely garbled,
+        # and stays (None, None, None).
         if len(re.findall(r'\d', region)) >= 6:
-            return None, None
-        return 0, 0
+            return None, None, None
+        return 0, 0, 0
 
-    chronological = []  # most-recent-first, real (non-blank) readings only
+    calendar_positions = 0
+    twelve_month_boundary = None  # index into chronological where 12 months is reached
+    chronological = []  # most-recent-first, real (non-blank) readings only, UNCAPPED
     seen_years = set()
     for i, ym in enumerate(year_matches):
-        if len(chronological) >= 12:
-            break
         year = ym.group(1)
         if year in seen_years:
             break
@@ -841,15 +866,21 @@ def _extract_dpd_window(block: str):
         cell_end = year_matches[i + 1].start() if i + 1 < len(year_matches) else len(region)
         cells = _CELL_RE.findall(region[cell_start:cell_end])[:12]
         for token in reversed(cells):
+            if token.strip() == '-':
+                continue
+            calendar_positions += 1
             dpd = _cell_to_dpd(token)
             if dpd is not None:
                 chronological.append(dpd)
-            if len(chronological) >= 12:
-                break
+            if calendar_positions == 12 and twelve_month_boundary is None:
+                twelve_month_boundary = len(chronological)
 
     if not chronological:
-        return None, None
-    return chronological[0], max(chronological[:12])
+        return None, None, None
+    twelve_mo_values = chronological[:twelve_month_boundary] if twelve_month_boundary is not None else chronological
+    max_12mo = max(twelve_mo_values) if twelve_mo_values else 0
+    max_alltime = max(chronological)
+    return chronological[0], max_12mo, max_alltime
 
 
 def _has_written_off_signal(block: str) -> bool:
@@ -979,10 +1010,16 @@ def extract_account(acct_num: int, block: str,
                     loan_type: str = None, entity: str = None,
                     max_dpd: int = None) -> dict:
     block_dpd = _extract_max_dpd(block)
-    last_reported_dpd, max_dpd_12mo = _extract_dpd_window(block)
-    # Positional dpd (from the compact summary grid) and the block's own dpd
-    # can each be a genuine int or an unreadable None - take the higher of
-    # the two when both are readable, otherwise whichever one is.
+    last_reported_dpd, max_dpd_12mo, grid_max_alltime = _extract_dpd_window(block)
+    # Positional dpd (from the compact summary grid), the block's own flat
+    # scan, and the grid-window walk's own all-time max (grid_max_alltime -
+    # preferred over block_dpd when available, since it doesn't share
+    # block_dpd's blind spot: block_dpd only falls back to a letter-
+    # placeholder reading when NO numeric cell exists anywhere in the block,
+    # so it can silently miss a worse 'XXX/SUB'-style reading sitting
+    # alongside lower numeric ones - confirmed on a real report, see
+    # _extract_dpd_window's own docstring) - can each be a genuine int or an
+    # unreadable None - take the higher of whichever are readable.
     #
     # KNOWN GAP (investigated, not fixed): on page-dense reports where one
     # block's captured span holds more than one "As on:" grid section, this
@@ -998,12 +1035,8 @@ def extract_account(acct_num: int, block: str,
     # including ones otherwise verified fully correct. Flagging here rather
     # than shipping an untested heuristic that could silently break the
     # legitimate case.
-    if max_dpd is None:
-        combined_dpd = block_dpd
-    elif block_dpd is None:
-        combined_dpd = max_dpd
-    else:
-        combined_dpd = max(max_dpd, block_dpd)
+    _dpd_candidates = [d for d in (max_dpd, block_dpd, grid_max_alltime) if d is not None]
+    combined_dpd = max(_dpd_candidates) if _dpd_candidates else None
     return {
         "sr_no":            acct_num,
         "date_of_sanction": _extract_date(block),
