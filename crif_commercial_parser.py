@@ -23,7 +23,7 @@ Public API mirrors crif_parser.parse_crif:
 import re
 
 # Reuse the shared int helper shape from crif_parser.
-from crif_parser import to_int
+from crif_parser import to_int, _YEAR_RE, _CELL_RE, _cell_to_dpd
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -493,6 +493,18 @@ def _extract_loan_type(block: str) -> str:
     # applicant-details header that can precede the real label in the same block.
     m = re.search(r'\bType\s*:\s*(.*?)(?:' + _STOP + r'|\n|$)', block, re.IGNORECASE)
     val = m.group(1).strip() if m else ""
+    # If the captured text leaves an unclosed '(', the phrase wraps onto the
+    # next physical line - confirmed on a real report: "Medium Term Loan
+    # (Period\nabove 1 year and upto 3 years)" was silently truncated to
+    # "Medium Term Loan (Period" (missing exactly the distinguishing phrase
+    # a _LOAN_TYPE_NORMALIZE pattern already exists for, but never got a
+    # chance to match since the text never reached it). Only triggers on
+    # this narrow, unambiguous signal - real parenthesized types elsewhere
+    # in this file balance on one line and are unaffected.
+    if m and val.count('(') > val.count(')'):
+        m2 = re.match(r'\s*(.*?)(?:' + _STOP + r'|\n|$)', block[m.end():], re.IGNORECASE)
+        if m2 and m2.group(1).strip():
+            val = (val + ' ' + m2.group(1).strip()).strip()
     val = re.sub(r'\s{2,}', ' ', val).strip(' -')
     # Strip "- In INR" / "-In INR" currency suffix (appears on same line as loan type)
     val = re.sub(r'\s*-?\s*In\s+INR\s*$', '', val, flags=re.IGNORECASE).strip(' -')
@@ -502,9 +514,15 @@ def _extract_loan_type(block: str) -> str:
     m = re.search(r'\s{2,}[A-Z]{2,}', val)
     if m:
         val = val[:m.start()].strip()
-    # Normalize known truncated / noisy OCR loan type strings
+    # Normalize known truncated / noisy OCR loan type strings. search (not
+    # match) - the line-wrap fix above can leave the distinguishing phrase
+    # a pattern targets (e.g. "above 1 year and upto 3 years") sitting
+    # after the original prefix ("Medium Term Loan (Period ...") rather
+    # than at position 0; every pattern here is a specific enough phrase
+    # that searching anywhere in val is safe, and any pattern that still
+    # needs start/end anchoring already spells that out with ^/$ inline.
     for pat, replacement in _LOAN_TYPE_NORMALIZE.items():
-        if re.match(pat, val, re.IGNORECASE):
+        if re.search(pat, val, re.IGNORECASE):
             return replacement
     # Fallback: if what we extracted is clearly OCR noise (too short or a known garbage
     # token like "ppp"), search the full block text for a recognizable loan type phrase.
@@ -612,6 +630,128 @@ def _extract_max_dpd(block: str) -> int | None:
         if 10 <= v < 999:
             vals.append(v)
     return max(vals) if vals else 0
+
+
+def _commercial_cell_to_dpd(token: str):
+    """
+    Wraps crif_parser.py's _cell_to_dpd with the same >=10 floor
+    _extract_max_dpd already applies to clean-cell ('NNN/xxx' or 'NNN/STD')
+    tokens - without it, a genuine small reading like '003/xxx' (confirmed
+    on a real DIGITAL, non-OCR report) would be accepted here but rejected
+    by _extract_max_dpd, producing an impossible max_dpd_12mo > max_dpd.
+    Named non-standard buckets ('045/SMA' etc, or the 'XXX/SMA' letter-
+    placeholder form) are trusted at any value, matching _extract_max_dpd.
+
+    NOTE: this floor exists to filter OCR leading-zero misreads
+    ('000'->'200') and is applied here unconditionally, same as
+    _extract_max_dpd - neither function currently knows whether the report
+    was scanned or digital, so a genuine small DPD on a digital report can
+    still be filtered out. Fixing that needs a scanned flag threaded through
+    both call chains - a separate, larger change from this windowing fix.
+    """
+    dpd = _cell_to_dpd(token)
+    if dpd is None:
+        return None
+    m = re.match(r'(\d{1,3}|XXX)\s*/\s*([A-Za-z]{2,3})', token.strip(), re.IGNORECASE)
+    if not m:
+        return dpd
+    days_part, cls = m.group(1), m.group(2).upper()
+    if days_part.upper() != 'XXX' and cls in ('XXX', 'STD') and dpd < 10:
+        return None
+    return dpd
+
+
+def _extract_dpd_window(block: str):
+    """
+    Reads the 'Payment History/Asset Classification' grid in true
+    chronological order (most-recent-first) to derive the trailing-12-month
+    max DPD and the most recently reported DPD. Mirrors crif_parser.py's
+    _extract_dpd_window exactly (same grid shape confirmed on a real report:
+    a year label followed by 12 month cells) and reuses its cell-parsing
+    primitives rather than duplicating them.
+
+    IMPORTANT: the 'Current Balance History (12 Months)' table that sits
+    directly above this grid in the same block is a DIFFERENT table
+    (balance only) - despite the shared '(12 Months)' wording, it does NOT
+    mean the Payment History/DPD grid below it is also 12-month-scoped.
+    That grid can span multiple years (confirmed on a real report: one
+    account's grid ran from 2023 through 2026). _extract_max_dpd's flat,
+    whole-block read was previously reused as a stand-in for max_dpd_12mo
+    on the assumption it was already 12-month-scoped - that assumption was
+    wrong (confirmed by cross-checking against an independent extraction on
+    a real report: the true trailing-12-month max was 47, while the
+    all-time max being reused was 78, from 19 months earlier).
+
+    Also returns an all-time max computed from this same, properly-scoped
+    grid walk - preferred over _extract_max_dpd's whole-block regex scan
+    when available, since _extract_max_dpd's strict class allowlist
+    (SMA/SUB/DBT/LOS/xxx/STD only, no OCR-garble tolerance) is what let a
+    real garbled cell ('012/xxx' OCR'd as 'O12 /rox') go completely
+    unmatched on a real scanned report, silently under-reporting max_dpd as
+    0 when the true value was 12. _extract_max_dpd's stricter matching
+    exists because IT scans the whole block, not just the grid region, so
+    it needs the strict allowlist as a false-positive guard; this function
+    can safely be more lenient because it's already anchored to the real
+    grid via the year-label walk.
+
+    Returns (last_reported_dpd, max_dpd_12mo, max_dpd_alltime), each None
+    if the grid couldn't be read at all.
+    """
+    m = re.search(r'Payment\s+History', block, re.IGNORECASE)
+    region = block[m.end():] if m else block
+    year_matches = list(_YEAR_RE.finditer(region))
+    if not year_matches:
+        if len(re.findall(r'\d', region)) >= 6:
+            return None, None, None
+        return 0, 0, 0
+
+    # calendar_positions counts actual non-blank calendar months walked -
+    # this drives where the 12-month boundary falls, not the count of
+    # floor-passing values. A real report confirmed why: an account with
+    # several genuine small readings ('001/xxx', floor-rejected as presumed
+    # noise) needs those months to still count as "covered", or the walk
+    # would reach into a 13th calendar month to compensate and silently
+    # widen the 12-month window. Blank ('-') cells are the only thing
+    # skipped without counting - they mean no data that month, not "data
+    # rejected". The walk itself is NOT capped at 12 months anymore - it
+    # continues (bounded only by the duplicate-year guard, same as before)
+    # so the all-time max can be computed from this same properly-scoped
+    # grid instead of falling back to _extract_max_dpd's less precise scan.
+    calendar_positions = 0
+    twelve_month_boundary = None  # index into floored_all where 12 months is reached
+    raw_chronological = []        # unfiltered - for last_reported_dpd
+    floored_all = []              # floor-applied, uncapped - for max_dpd_12mo/alltime
+    seen_years = set()
+    for i, ym in enumerate(year_matches):
+        year = ym.group(1)
+        if year in seen_years:
+            break
+        seen_years.add(year)
+        cell_start = ym.end()
+        cell_end = year_matches[i + 1].start() if i + 1 < len(year_matches) else len(region)
+        cells = _CELL_RE.findall(region[cell_start:cell_end])[:12]
+        for token in reversed(cells):
+            if token.strip() == '-':
+                continue
+            calendar_positions += 1
+            raw_dpd = _cell_to_dpd(token)
+            if raw_dpd is not None:
+                raw_chronological.append(raw_dpd)
+            floored_dpd = _commercial_cell_to_dpd(token)
+            if floored_dpd is not None:
+                floored_all.append(floored_dpd)
+            if calendar_positions == 12 and twelve_month_boundary is None:
+                twelve_month_boundary = len(floored_all)
+
+    if not raw_chronological and not floored_all:
+        return None, None, None
+    last_reported = raw_chronological[0] if raw_chronological else None
+    twelve_mo_values = floored_all[:twelve_month_boundary] if twelve_month_boundary is not None else floored_all
+    # Mirrors _extract_max_dpd's own convention: real cells were found but
+    # none passed the noise floor -> confident clean (0), not unreadable.
+    max_12mo = max(twelve_mo_values) if twelve_mo_values else 0
+    max_alltime = max(floored_all) if floored_all else 0
+    return last_reported, max_12mo, max_alltime
 
 
 # Non-standard asset classes (a positive DPD here is genuine delinquency).
@@ -723,6 +863,46 @@ def _status_pill_map(text: str, trade_starts: list) -> tuple:
                 if word == "DELINQUENT":
                     delinquent.add(ti)
         prev_end = cpos
+    return status_map, delinquent
+
+
+_INLINE_PILL_RE = re.compile(
+    r'Info\.\s+as\s+of:\s*\n\d{2}-\d{2}-\d{4}\n(' + _STATUS_PILL_WORD + r')\n'
+)
+
+
+def _inline_pill_map(text: str, trade_starts: list) -> tuple:
+    """
+    Secondary status source for report layouts where the ACTIVE/CLOSED pill
+    is printed inline within each trade's own preamble ('Info. as of:
+    <date>\\n<PILL>\\n', right before 'Type:') instead of clustered together
+    after a shared page footer. Confirmed on a real report where
+    _status_pill_map's cluster regex never matched at all (the pill wasn't
+    directly after 'Confidential\\n' - several preamble lines sat between
+    them instead), silently sending two adjacent accounts to
+    _resolve_status()'s guess-based fallback, which swapped their Active/
+    Closed status - a large still-open account read as Closed and a small
+    genuinely-closed one read as Active, corrupting the report's
+    sanctioned-amount validation by the exact size of the misclassified
+    account.
+
+    Only fills gaps _status_pill_map() left unresolved for a given trade -
+    never overrides a trade _status_pill_map already resolved, so a report
+    with a genuine footer-cluster layout is unaffected by this function
+    existing at all.
+
+    Returns (status_map, delinquent_set), same shape as _status_pill_map.
+    """
+    status_map, delinquent = {}, set()
+    for i, start in enumerate(trade_starts):
+        window = text[max(0, start - 200):start]
+        m = _INLINE_PILL_RE.search(window)
+        if not m:
+            continue
+        word = m.group(1)
+        status_map[i] = _PILL_STATUS_MAP[word]
+        if word == "DELINQUENT":
+            delinquent.add(i)
     return status_map, delinquent
 
 
@@ -868,6 +1048,27 @@ def extract_account(ordinal: int, block: str, scanned: bool = False) -> dict:
     # for a literal day-count, and SMA-0 already satisfies the OR on its own.
     current_dpd = _classification_dpd(clean)
     classification_delinquent = current_dpd is not None and current_dpd > 0
+    # Grid-based window read is preferred (a real numeric/positional day
+    # count) over the classification label's generic bucket value - e.g. a
+    # label of "SPECIAL MENTION ACCOUNT" alone maps to a representative 1
+    # (SMA-0) with no way to tell SMA-0 from SMA-2, while the grid's own
+    # most-recent cell can show the true reading (confirmed on a real
+    # report: classification-based last_reported_dpd read 1, the grid's own
+    # most recent cell read 34). Falls back to the classification-based
+    # current_dpd/all-time max_dpd when the grid itself can't be read at
+    # all, so a genuinely unreadable grid still degrades to the previous
+    # (less precise but non-null) behavior rather than losing the field.
+    grid_last_reported, grid_max_12mo, grid_max_alltime = _extract_dpd_window(clean)
+    # grid_max_alltime is preferred over _extract_max_dpd(clean) when the
+    # grid could be read at all - it's computed from the same properly
+    # year-anchored walk as the other two fields, which tolerates OCR
+    # garbling _extract_max_dpd's strict class allowlist can miss entirely
+    # (confirmed on a real scanned report: a garbled '012/xxx' cell read as
+    # 'O12 /rox' matched here but not there, so _extract_max_dpd silently
+    # fell back to a less precise reading of 0 for an account with a real
+    # DPD of 12). Falls back to _extract_max_dpd(clean) only when the grid
+    # itself can't be read at all (no year label found).
+    max_dpd_val = grid_max_alltime if grid_max_alltime is not None else _extract_max_dpd(clean)
     return {
         "sr_no":            ordinal,
         "date_of_sanction": _extract_date(clean),
@@ -878,9 +1079,9 @@ def extract_account(ordinal: int, block: str, scanned: bool = False) -> dict:
         "entity":           _extract_entity(clean),
         "ownership":        _extract_ownership(clean),
         "type_of_loan":     _extract_loan_type(clean),
-        "max_dpd":          _extract_max_dpd(clean),
-        "last_reported_dpd": current_dpd,
-        "max_dpd_12mo":       _extract_max_dpd(clean),
+        "max_dpd":          max_dpd_val,
+        "last_reported_dpd": grid_last_reported if grid_last_reported is not None else current_dpd,
+        "max_dpd_12mo":       grid_max_12mo if grid_max_12mo is not None else _extract_max_dpd(clean),
         "status":           status,
         # Delinquent is an overlay on a still-OPEN account - a Closed/Written
         # Off/Settled account can carry a non-Standard classification too
@@ -1090,6 +1291,14 @@ def parse_crif_commercial(text: str, scanned: bool = False) -> tuple:
     _marker = _TRADE_MARKER_SCANNED if scanned else _TRADE_MARKER
     trade_starts = [m.start() for m in _marker.finditer(text)]
     status_map, delinquent_set = _status_pill_map(text, trade_starts)
+    # Fill gaps only - trades _status_pill_map already resolved keep that
+    # answer (see _inline_pill_map's own docstring for why this ordering).
+    already_resolved = set(status_map)
+    inline_status, inline_delinquent = _inline_pill_map(text, trade_starts)
+    for ti, st in inline_status.items():
+        if ti not in already_resolved:
+            status_map[ti] = st
+    delinquent_set |= (inline_delinquent - already_resolved)
 
     blocks, accounts = _expand_account_blocks(text, trade_starts, status_map,
                                               delinquent_set, scanned)
