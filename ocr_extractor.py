@@ -423,6 +423,13 @@ For EACH numbered account listed below, find its Payment History grid, determine
 uses, and return the MAXIMUM resulting DPD value across all months (Format A: highest NNN read; \
 Format B: representative value of the worst code seen).
 
+If TWO images are provided, they are consecutive pages in document order. This report's account \
+box can be split across a page break with the fields on the first page but the ENTIRE Payment \
+History section (including its own label) pushed onto the second - if the last account listed \
+below has no visible grid on the first image, look for it at the TOP of the second image instead \
+of answering null. Do not use the second image for any account other than one whose grid is \
+genuinely absent from the first.
+
 Accounts on this page, listed in TOP-TO-BOTTOM order as they appear on the page - sibling accounts \
 (e.g. the same guarantor obligation split across several loans) commonly share an identical \
 Sanctioned Date and Sanctioned Amount, so Current Balance and top-to-bottom position are the only \
@@ -458,12 +465,22 @@ def _extract_json_array(text: str) -> str:
     return matches[-1] if matches else text
 
 
-def vision_extract_dpd_from_uri(img_uri: str, accounts: list,
+def vision_extract_dpd_from_uri(img_uris, accounts: list,
                                 api_key: str, invoke_fn) -> list:
     """
-    Ask Gemini to read max DPD for accounts using a pre-rendered page image URI.
+    Ask Gemini to read max DPD for accounts using pre-rendered page image URI(s).
     Separated from rendering so callers can parallelise the API calls while keeping
     PyMuPDF rendering on the main thread (MuPDF is not thread-safe).
+
+    img_uris may be a single URI string (one page) or a list of URIs (consecutive
+    pages, in order) - the latter for accounts whose own Payment History section
+    is provably absent from their primary page (see parser._grid_spills_to_next_page):
+    the account box can be split by a page break with fields on one page and the
+    ENTIRE grid, including its own label, pushed to the next. Sending only the
+    first page in that case gave Gemini nothing to read and produced two
+    different failure shapes on a real report - a safe null, and a wrong-but-
+    plausible guessed 0 - depending on the call; a string kept for backward
+    compatibility with any existing single-page caller.
 
     Matched by POSITION, not by a "date|amount" content key: CRIF commonly prints
     sibling accounts (a guarantor obligation split across several loans) with an
@@ -476,6 +493,8 @@ def vision_extract_dpd_from_uri(img_uri: str, accounts: list,
     Returns a list the same length as `accounts`, each element the resolved DPD
     int or None if Gemini couldn't find/resolve that item.
     """
+    if isinstance(img_uris, str):
+        img_uris = [img_uris]
     lines = []
     for i, a in enumerate(accounts, 1):
         bal = a.get("current_balance")
@@ -487,8 +506,7 @@ def vision_extract_dpd_from_uri(img_uri: str, accounts: list,
     account_list = "\n".join(lines)
     content = [
         {"type": "text", "text": _DPD_PAGE_PROMPT.format(account_list=account_list, n=len(accounts))},
-        {"type": "image_url", "image_url": img_uri},
-    ]
+    ] + [{"type": "image_url", "image_url": uri} for uri in img_uris]
     try:
         raw    = invoke_fn(api_key, content)
         parsed = json.loads(_extract_json_array(_strip_json(raw)))

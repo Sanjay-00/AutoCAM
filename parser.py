@@ -21,6 +21,8 @@ from crif_parser import (
     extract_borrower_identity,
 )
 from crif_parser import _is_closed, _extract_balance, _extract_entity
+from crif_parser import _extract_max_dpd as _crif_extract_max_dpd
+from crif_parser import _extract_dpd_window as _crif_extract_dpd_window
 from crif_commercial_parser import parse_crif_commercial, credit_profile_summary, derog_summary
 from tu_parser   import parse_transunion
 import ocr_extractor
@@ -73,10 +75,17 @@ def _extract(doc, on_progress=None) -> tuple:
     Return (text, is_scanned, page_texts). Digital PDFs return embedded text;
     scanned PDFs are OCR'd (Tesseract) so the same text parsers can run, with
     per-page OCR kept for Vision page selection.
+
+    page_texts is populated for digital PDFs too (not just scanned) - the
+    Vision page-locator (_find_account_page) needs a real per-page list to
+    target a digital-report Vision fallback (e.g. recovering DPD on a block
+    whose text-extraction reading order got scrambled across account
+    boundaries - see _dpd_span_contaminated), not just an OCR one.
     """
-    text = _normalize_text("\n".join(page.get_text() for page in doc))
+    page_texts_raw = [page.get_text() for page in doc]
+    text = _normalize_text("\n".join(page_texts_raw))
     if len(text.strip()) >= ocr_extractor._SCAN_TEXT_THRESHOLD:
-        return text, False, None
+        return text, False, [_normalize_text(t) for t in page_texts_raw]
 
     combined, page_texts = ocr_extractor.ocr_document(doc, on_progress=on_progress)
     if len(combined.strip()) < 100:
@@ -513,9 +522,52 @@ def _val_quality(v: dict) -> tuple:
     return (1 if v.get("valid") else 0, -err)
 
 
-def _find_account_page(acc: dict, page_texts: list) -> int | None:
+_ACCOUNT_INFO_HDR_RE = re.compile(r'Account\s+Information', re.IGNORECASE)
+_PAYMENT_HISTORY_RE  = re.compile(r'Payment\s+History', re.IGNORECASE)
+
+
+def _grid_spills_to_next_page(page_text: str, match_pos: int) -> bool:
     """
-    Return the page index holding this account's own Payment History grid.
+    True when this account's own Payment History grid is provably NOT on the
+    same page as its header/fields - confirmed on a real report: the account
+    box can be split by a page break with fields on one page and the ENTIRE
+    "Payment History/Asset Classification:" section (label included) pushed
+    onto the next. Sending Vision only the located page in that case gives it
+    no grid to read at all, which produced two different failure shapes on a
+    real report - a safe null (no data, correctly declined) and a wrong-but-
+    plausible guessed 0 (a confident wrong number) - depending on the call,
+    neither acceptable when the real answer is one page over. The caller
+    renders the next page too when this is True.
+    """
+    next_hdr = _ACCOUNT_INFO_HDR_RE.search(page_text, match_pos + 1)
+    boundary = next_hdr.start() if next_hdr else len(page_text)
+    return not _PAYMENT_HISTORY_RE.search(page_text, match_pos, boundary)
+
+
+def _account_anchor_amount(acc: dict):
+    """
+    An amount field specific enough to locate on a page via text search - NOT
+    just any non-None amount. Current Balance is preferred (effectively
+    unique per account) but a Closed/written-off account commonly has it at
+    exactly 0 (confirmed on a real report), and "0" as a search pattern
+    matches almost any digit anywhere on the page - silently anchoring on a
+    random, unrelated "0" instead of failing loudly. Falls back to Sanctioned
+    Amount (Disbd Amt/High Credit), which is virtually always a real,
+    specific loan amount even for a written-off account. Returns None only
+    when neither field clears the specificity floor, so callers correctly
+    fall back further (date-only, or "can't verify") instead of anchoring on
+    a near-universal digit.
+    """
+    for amt in (acc.get("current_balance"), acc.get("sanction_amount")):
+        if amt is not None and abs(amt) >= 100:
+            return amt
+    return None
+
+
+def _find_account_page(acc: dict, page_texts: list) -> tuple:
+    """
+    Return (page_index, grid_spills_to_next_page) for this account's own
+    Payment History grid, or (None, False) if no page matches at all.
 
     Sanctioned Date alone is not a safe anchor - sibling accounts (a guarantor
     obligation split across several loans) commonly share the same date, so a
@@ -523,31 +575,339 @@ def _find_account_page(acc: dict, page_texts: list) -> int | None:
     (confirmed on a real report: two guarantor CV loans sanctioned the same
     day, one page apart - date-only lookup sent Vision the wrong page for the
     second one, and it correctly reported the account "not found" there).
-    Current Balance is checked first because it's effectively unique per
-    account (unlike the date), comparing digit-only so Indian comma grouping
-    ("11,95,399") can't cause a formatting mismatch against page text. Falls
-    back to date-only when balance is unreadable ("Check CIBIL"/None) or not
-    found on any page.
+    An amount anchor (_account_anchor_amount) is checked first because it's
+    effectively unique per account (unlike the date); matched allowing
+    optional Indian comma grouping between digits ("11,95,399") so the
+    position within the page is still known (needed for
+    _grid_spills_to_next_page), not just digit-stripped presence. Falls back
+    to date-only when no amount clears the specificity floor or isn't found
+    on any page.
     """
     date = acc.get("date_of_sanction", "")
     date_ok = bool(date and date != "NA")
-    bal = acc.get("current_balance")
-    bal_digits = re.sub(r'\D', '', str(bal)) if bal not in (None, "") else None
+    bal = _account_anchor_amount(acc)
+    bal_digits = re.sub(r'\D', '', str(bal)) if bal is not None else None
+    bal_pattern = re.compile(r',?'.join(re.escape(d) for d in bal_digits)) if bal_digits else None
 
     bal_only_match, date_only_match = None, None
     for pg_idx, pg_text in enumerate(page_texts):
-        has_date = date_ok and date in pg_text
-        has_bal  = bal_digits and bal_digits in re.sub(r'\D', '', pg_text)
+        bal_m    = bal_pattern.search(pg_text) if bal_pattern else None
+        date_pos = pg_text.find(date) if date_ok else -1
+        has_date = date_pos != -1
+        has_bal  = bal_m is not None
         if has_date and has_bal:
-            return pg_idx
+            return pg_idx, _grid_spills_to_next_page(pg_text, bal_m.start())
         if has_bal and bal_only_match is None:
-            bal_only_match = pg_idx
+            bal_only_match = (pg_idx, bal_m.start())
         if has_date and date_only_match is None:
-            date_only_match = pg_idx
+            date_only_match = (pg_idx, date_pos)
     # Balance alone is more specific than date alone (the field known to
     # repeat across sibling accounts) - prefer it when neither page matched
     # both fields together.
-    return bal_only_match if bal_only_match is not None else date_only_match
+    match = bal_only_match if bal_only_match is not None else date_only_match
+    if match is None:
+        return None, False
+    pg_idx, pos = match
+    return pg_idx, _grid_spills_to_next_page(page_texts[pg_idx], pos)
+
+
+_NAVY_BAR_FILL   = (0.0588, 0.2471, 0.4196)
+_DPD_ORANGE_FILL = (1.0, 0.5882, 0.3529)
+_DPD_RED_FILL    = (0.9804, 0.2353, 0.2353)
+
+
+def _fill_close(fill, target, tol: float = 0.03) -> bool:
+    return fill is not None and all(abs(a - b) < tol for a, b in zip(fill, target))
+
+
+def _indian_format(n: int) -> str:
+    """
+    Indian digit-grouping (lakh/crore: 3 digits, then pairs) - e.g. 1243364
+    -> "12,43,364". Python's f"{n:,}" produces WESTERN grouping ("1,243,364")
+    instead, which never matches CRIF's own printed balance text and made
+    page.search_for() silently find nothing (confirmed: this exact mismatch
+    made _account_dpd_color_bucket return None - "can't verify" - for every
+    account, silently disabling the colour cross-check entirely rather than
+    raising, since a signature match failure isn't the caller's fault to see).
+    """
+    s = str(abs(int(n)))
+    if len(s) <= 3:
+        return s
+    last3, rest = s[-3:], s[:-3]
+    parts = []
+    while len(rest) > 2:
+        parts.insert(0, rest[-2:])
+        rest = rest[:-2]
+    if rest:
+        parts.insert(0, rest)
+    return ",".join(parts) + "," + last3
+
+
+def _band_color_bucket(drawings: list, y0: float, y1: float) -> str:
+    """Worst DPD colour ('clean' < 'orange' < 'red') among vector fills whose
+    rect top falls within [y0, y1) on one page - see
+    _account_dpd_color_bucket for what these buckets mean."""
+    bucket = "clean"
+    for d in drawings:
+        fill = d.get("fill")
+        if fill is None:
+            continue
+        if not (y0 <= d["rect"].y0 < y1):
+            continue
+        if _fill_close(fill, _DPD_RED_FILL):
+            return "red"
+        if _fill_close(fill, _DPD_ORANGE_FILL):
+            bucket = "orange"
+    return bucket
+
+
+def _account_page_band(doc, pages: list, acc: dict):
+    """
+    Locate this account's own box on the page(s) it appears on, bounded by
+    its navy "Account Information" title bar and the next one (or page
+    bottom) - a geometric boundary that's immune to the linear-text reading-
+    order scrambling documented in _dpd_span_contaminated and
+    _grid_spills_to_next_page, since it comes from the PDF's own vector
+    layout, not text order. Returns None if this account's own anchor amount
+    (_account_anchor_amount) can't be located on pages[0] at all.
+
+    pages is [primary_page] or [primary_page, next_page] for an account whose
+    grid spills across a page break - the continuation page has no header of
+    its own to anchor on, so its whole span up to the next account's navy
+    title bar (or page bottom) is treated as this account's own continuation,
+    only used when the primary page's own band comes back with nothing to
+    read past its own navy bar.
+
+    Returns a dict: page0, start, end, drawings0, page1 (or None), end1 (or
+    None), drawings1 (or None).
+    """
+    bal = _account_anchor_amount(acc)
+    if bal is None:
+        return None
+    page0 = doc[pages[0]]
+    hits  = page0.search_for(_indian_format(bal))
+    if not hits:
+        return None
+    y_acc     = hits[0].y0
+    drawings0 = page0.get_drawings()
+    navy_ys   = sorted(d["rect"].y0 for d in drawings0 if _fill_close(d.get("fill"), _NAVY_BAR_FILL))
+    start     = max([y for y in navy_ys if y <= y_acc], default=0)
+    later     = [y for y in navy_ys if y > y_acc]
+    end       = later[0] if later else page0.rect.height
+    band = {"page0": page0, "start": start, "end": end, "drawings0": drawings0,
+            "page1": None, "end1": None, "drawings1": None}
+    if not later and len(pages) > 1:
+        page1 = doc[pages[1]]
+        drawings1 = page1.get_drawings()
+        navy1 = sorted(d["rect"].y0 for d in drawings1 if _fill_close(d.get("fill"), _NAVY_BAR_FILL))
+        band["page1"]     = page1
+        band["end1"]      = navy1[0] if navy1 else page1.rect.height
+        band["drawings1"] = drawings1
+    return band
+
+
+def _account_clip_text(doc, pages: list, acc: dict):
+    """
+    This account's own text, clipped to its geometric box (_account_page_band)
+    instead of trusting the linear-text reading order - the same fix as the
+    colour cross-check, applied to text instead of fills. Returns None if the
+    account's own anchor can't be located.
+    """
+    band = _account_page_band(doc, pages, acc)
+    if band is None:
+        return None
+    text = band["page0"].get_text(
+        "text", clip=fitz.Rect(0, band["start"], band["page0"].rect.width, band["end"]))
+    if band["page1"] is not None:
+        text += "\n" + band["page1"].get_text(
+            "text", clip=fitz.Rect(0, 0, band["page1"].rect.width, band["end1"]))
+    return text
+
+
+_STATUS_SIDEBAR_X_MAX = 60
+
+
+def _account_status_geometry(doc, pages: list, acc: dict):
+    """
+    Read this account's own literal sidebar status tag ("Active"/"Closed", a
+    label printed at the far left margin of its box) directly from its
+    geometrically-isolated region (_account_page_band), instead of trusting
+    crif_parser's text-heuristic _is_closed. Confirmed on a real report:
+    _is_closed's Written-off-in-Remarks rule can be tripped by a DIFFERENT,
+    contaminated account's remark bleeding into this account's own Remarks
+    field - the same reading-order contamination documented for DPD, but
+    here with every swallowed Account # masked identically ("xxxx"), which
+    _dpd_span_contaminated's distinct-real-code check can't catch at all.
+    The corrupted block's own linear text even carried four bare "Active"
+    tokens that nothing was checking for.
+
+    Filtering to x0 < 60 is load-bearing, not a tuning knob: it excludes the
+    "Closed Date:" FIELD LABEL, which sits mid-row (~x=223 on a standard
+    page) in EVERY account's box regardless of true status - an earlier,
+    unfiltered version of this same check misread that field label as a
+    second-column "Closed" status tag and produced false positives across
+    an entire page before the mistake was caught.
+
+    Returns "Active", "Closed", or None if the tag can't be read
+    unambiguously (not found, or both words present - the sidebar strip
+    itself spilling across a page break the same way a DPD grid can).
+    """
+    band = _account_page_band(doc, pages, acc)
+    if band is None:
+        return None
+    words0 = band["page0"].get_text("words")
+    statuses = {w[4] for w in words0
+                if band["start"] <= w[1] < band["end"] and w[4] in ("Active", "Closed")
+                and w[0] < _STATUS_SIDEBAR_X_MAX}
+    if band["page1"] is not None:
+        words1 = band["page1"].get_text("words")
+        statuses |= {w[4] for w in words1
+                     if 0 <= w[1] < band["end1"] and w[4] in ("Active", "Closed")
+                     and w[0] < _STATUS_SIDEBAR_X_MAX}
+    return next(iter(statuses)) if len(statuses) == 1 else None
+
+
+def _geometry_recover_status(accounts: list, doc, page_texts: list) -> list:
+    """
+    Reads every account's own geometric sidebar tag (_account_status_geometry)
+    - CRIF's own literal "Active"/"Closed" printed label - and records it
+    verbatim on the account as "status_per_cibil", independent of whatever
+    crif_parser's text-heuristic _is_closed concluded. When the two disagree
+    and the sidebar read is unambiguous, "status" is also corrected to match
+    it - confirmed on a real report to catch 8 accounts wrongly marked Closed
+    by contaminated Remarks-field text, all independently verified Active by
+    their own sidebar tag.
+
+    "status_per_cibil" is populated for every account this can read (not
+    just the ones it corrects) so it can be shown as its own column - an
+    analyst can then see both crif_parser's derived status and CRIF's own
+    printed tag side by side, including the (rare) cases they still agree.
+    Left as None when the tag can't be read unambiguously (not found on this
+    account's own anchor, or the sidebar strip itself spills across a page
+    break the same way a DPD grid can) - shown as "Check CIBIL", not guessed.
+
+    Digital reports only (doc/page_texts are PyMuPDF's own vector/text
+    layer, meaningless once OCR'd to a flat string). Mutates accounts
+    in-place; returns the sorted sr_no of every account whose "status" this
+    corrected (not merely recorded).
+    """
+    corrected = []
+    for acc in accounts:
+        pg, spills = _find_account_page(acc, page_texts)
+        if pg is None:
+            acc["status_per_cibil"] = None
+            continue
+        pages = [pg] + ([pg + 1] if spills else [])
+        try:
+            truth = _account_status_geometry(doc, pages, acc)
+        except Exception:
+            truth = None
+        acc["status_per_cibil"] = truth
+        if truth is not None and truth != acc["status"]:
+            acc["status"] = truth
+            corrected.append(acc["sr_no"])
+    return sorted(corrected)
+
+
+def _account_dpd_color_bucket(doc, pages: list, acc: dict):
+    """
+    Independent, Gemini-free cross-check on a Vision-read max_dpd: CRIF's own
+    report colours a payment-history cell orange for 30 < DPD <= 90 and red
+    for DPD > 90 (never for DPD <= 30) - confirmed against five real accounts
+    across this report (031->orange, 381->red, and three genuinely
+    uncoloured accounts, one of them the exact case where Vision separately
+    hallucinated 47, which this catches as inconsistent with 'clean').
+    Read directly from the PDF's own vector fill colours (page.get_drawings()),
+    not a rendered image, so verifying a Vision answer costs zero extra model
+    calls. Returns "clean" (implies DPD <= 30), "orange" (30 < DPD <= 90),
+    "red" (DPD > 90), or None if this account's own anchor can't be located
+    (see _account_page_band) - callers must not gate on None, since there's
+    no basis to accept or reject in that case.
+    """
+    band = _account_page_band(doc, pages, acc)
+    if band is None:
+        return None
+    bucket = _band_color_bucket(band["drawings0"], band["start"], band["end"])
+    if bucket == "clean" and band["page1"] is not None:
+        bucket = _band_color_bucket(band["drawings1"], 0, band["end1"])
+    return bucket
+
+
+def _geometry_extract_dpd(doc, pages: list, acc: dict):
+    """
+    Deterministic recovery of (max_dpd, last_reported_dpd, max_dpd_12mo) for
+    an account whose rule-based linear-text reading came back None - clips
+    the PDF to this account's own geometric box (_account_clip_text) instead
+    of trusting the scrambled/contaminated linear text, then runs the SAME
+    regex logic the normal rule-based path uses (pre_scoped=True, since the
+    "Payment History" label can land AFTER the grid values in this clipped
+    text's own reading order - see crif_parser._extract_max_dpd's note).
+
+    Tried BEFORE any Vision call, not just as a cross-check on one - this is
+    the "exhaust determinism first" tier: confirmed on a real report to
+    recover 5/5 accounts correctly, including one (true DPD=1) that Vision
+    could not read reliably even across repeated attempts. Geometry beats
+    both linear-text contamination AND Vision's small-digit legibility
+    limits, and costs no model call at all.
+
+    Returns (None, None, None) if the account's own anchor can't be located
+    or the clipped text still doesn't resolve - callers should fall through
+    to Vision in that case, not treat this as a final answer.
+    """
+    text = _account_clip_text(doc, pages, acc)
+    if text is None:
+        return None, None, None
+    max_dpd_flat = _crif_extract_max_dpd(text, pre_scoped=True)
+    last_reported, max_12mo, max_alltime = _crif_extract_dpd_window(text, pre_scoped=True)
+    combined = max((v for v in (max_dpd_flat, max_alltime) if v is not None), default=None)
+    return combined, last_reported, max_12mo
+
+
+def _geometry_recover_dpd(accounts: list, doc, page_texts: list) -> list:
+    """
+    First-tier DPD recovery for every account whose rule-based reading came
+    back None - pure PDF geometry (_geometry_extract_dpd), no Gemini call.
+    Mutates accounts in-place; called BEFORE deciding whether Vision is even
+    needed, so accounts this resolves never reach the Vision fallback at all
+    - the "exhaust determinism before VLM" tier. Returns the sorted sr_no of
+    every account it resolved, for the caller's own summary/telemetry.
+    """
+    recovered = []
+    for acc in accounts:
+        if acc.get("max_dpd") is not None:
+            continue
+        pg, spills = _find_account_page(acc, page_texts)
+        if pg is None:
+            continue
+        pages = [pg] + ([pg + 1] if spills else [])
+        try:
+            max_dpd, last_reported, max_12mo = _geometry_extract_dpd(doc, pages, acc)
+        except Exception:
+            continue
+        if max_dpd is not None:
+            acc["max_dpd"]           = max_dpd
+            acc["last_reported_dpd"] = last_reported
+            acc["max_dpd_12mo"]      = max_12mo
+            recovered.append(acc["sr_no"])
+    return sorted(recovered)
+
+
+def _dpd_matches_color(dpd: int, bucket) -> bool:
+    """
+    True if a Vision-read DPD value is consistent with the report's own
+    colour coding for that account's worst cell - False means Vision most
+    likely misread the cell (see _account_dpd_color_bucket's docstring).
+    bucket=None (anchor not found, can't verify either way) always passes.
+    """
+    if bucket is None:
+        return True
+    if bucket == "clean":
+        return dpd <= 30
+    if bucket == "orange":
+        return 30 < dpd <= 90
+    if bucket == "red":
+        return dpd > 90
+    return True
 
 
 def _enrich_dpd_vision(accounts: list, doc, page_texts: list, api_key: str,
@@ -581,30 +941,46 @@ def _enrich_dpd_vision(accounts: list, doc, page_texts: list, api_key: str,
 
     # Group accounts whose DPD OCR genuinely couldn't read (None) by PDF page.
     # Confident 0-DPD reads are trusted as-is and NOT re-checked here.
-    page_map: dict[int, list] = {}
+    # needs_next[pg] is True when ANY account grouped on that page has its own
+    # grid provably absent there (see _grid_spills_to_next_page) - the whole
+    # page's call then also gets the next page's image so Vision has
+    # something real to read for that account instead of guessing.
+    page_map:   dict[int, list] = {}
+    needs_next: dict[int, bool] = {}
     for acc in accounts:
         if acc.get("max_dpd") is None:
-            pg = _find_account_page(acc, page_texts)
+            pg, spills = _find_account_page(acc, page_texts)
             if pg is not None:
                 page_map.setdefault(pg, []).append(acc)
+                needs_next[pg] = needs_next.get(pg, False) or spills
 
     summary = {"pages_sent": [], "accounts_checked": [], "accounts_patched": []}
     if not page_map:
         return summary
 
-    summary["pages_sent"]       = sorted(pg + 1 for pg in page_map)
     summary["accounts_checked"] = sorted(acc["sr_no"] for accs in page_map.values() for acc in accs)
 
     # Render all page images on the main thread first. A single malformed page
     # (corrupt embedded image, bad content stream) must not abort the whole
     # extraction - skip it and leave its accounts unresolved (Check CIBIL)
     # rather than losing every already-validated account to one bad render.
-    page_uris = {}
+    page_uris  = {}
+    pages_sent = set()
     for pg_idx in page_map:
+        uris = []
         try:
-            page_uris[pg_idx] = ocr_extractor._img_data_uri(doc[pg_idx])
+            uris.append(ocr_extractor._img_data_uri(doc[pg_idx]))
+            pages_sent.add(pg_idx + 1)
         except Exception:
             continue
+        if needs_next.get(pg_idx) and pg_idx + 1 < len(doc):
+            try:
+                uris.append(ocr_extractor._img_data_uri(doc[pg_idx + 1]))
+                pages_sent.add(pg_idx + 2)
+            except Exception:
+                pass
+        page_uris[pg_idx] = uris
+    summary["pages_sent"] = sorted(pages_sent)
 
     total = len(page_uris)
     if not total:
@@ -633,14 +1009,25 @@ def _enrich_dpd_vision(accounts: list, doc, page_texts: list, api_key: str,
             # not by a date|amount key - sibling accounts (same guarantor
             # obligation split across loans) commonly share both fields, so a
             # content key would silently merge two different accounts' DPD.
+            acc_pages = [pg_idx] + ([pg_idx + 1] if needs_next.get(pg_idx) else [])
             for acc, dpd in zip(page_map[pg_idx], dpd_list):
-                # Accept whatever Gemini reports, including 0 - these accounts
-                # started as None (unread), so even a confirmed 0 resolves the
-                # uncertainty and is worth recording. Left as None (Check CIBIL)
-                # only if Gemini had no answer for this position at all.
-                if dpd is not None:
-                    acc["max_dpd"] = dpd
-                    summary["accounts_patched"].append(acc["sr_no"])
+                if dpd is None:
+                    continue
+                # Cross-check against the report's own colour coding before
+                # trusting a Vision read (see _account_dpd_color_bucket) -
+                # confirmed necessary on a real report: Vision misread a
+                # genuinely uncoloured (<=30) cell as 47, which this catches
+                # and rejects instead of shipping a confident wrong number.
+                # A None bucket (anchor not found) can't be checked either
+                # way and is accepted as before.
+                try:
+                    bucket = _account_dpd_color_bucket(doc, acc_pages, acc)
+                except Exception:
+                    bucket = None
+                if not _dpd_matches_color(dpd, bucket):
+                    continue
+                acc["max_dpd"] = dpd
+                summary["accounts_patched"].append(acc["sr_no"])
 
     summary["accounts_patched"].sort()
     return summary
@@ -829,6 +1216,22 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
     name, score, blocks, accounts, reported = parse_crif(text)
     _renumber(accounts)
 
+    # Geometry-based status correction (digital reports only) - runs BEFORE
+    # validation since a corrected status changes active-account counts and
+    # the active-only balance sum. See _geometry_recover_status's docstring:
+    # this catches accounts _is_closed wrongly closed via contaminated
+    # Remarks-field text, independent of and complementary to the DPD-only
+    # geometry recovery below.
+    if not scanned and page_texts:
+        status_corrected = _geometry_recover_status(accounts, doc, page_texts)
+    else:
+        # Scanned reports have no vector/text layer for this to read at all -
+        # "Check CIBIL" (None), not a guess, same convention as every other
+        # unreadable field.
+        for acc in accounts:
+            acc["status_per_cibil"] = None
+        status_corrected = []
+
     extraction_method = METHOD_OCR if scanned else METHOD_RULE_BASED
     # CRIF Retail's Account Summary "Total Amount Overdue" includes Closed
     # accounts (unlike Total Current Balance, which is active-only) - see
@@ -861,6 +1264,16 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
                     extraction_method = METHOD_LLM_FULL
                     validation        = validate_extraction(accounts, reported, overdue_scope_all_accounts=True)
 
+    # Geometry-first DPD recovery (digital reports only - doc/page_texts are
+    # PyMuPDF's own text/vector layer, meaningless once a page has been OCR'd
+    # to a flat string). Tries pure PDF geometry before ever considering
+    # Vision - see _geometry_recover_dpd's docstring; confirmed on a real
+    # report to resolve 5/5 accounts Vision either couldn't read reliably or
+    # needed multiple attempts for, at zero model-call cost.
+    geometry_dpd_recovered = (
+        _geometry_recover_dpd(accounts, doc, page_texts) if not scanned and page_texts else []
+    )
+
     # DPD Vision enrichment - same opt-in mechanism and _enrich_dpd_vision
     # helper as CRIF Commercial (see its docstring). Retail has no
     # full-account Vision fallback (crif_parser's block-splitting/regex
@@ -868,7 +1281,21 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
     # vision_extract_accounts) - this only patches the one field OCR left
     # unreadable (max_dpd is None) on a badly garbled payment-history grid.
     has_unread_dpd = any(a.get("max_dpd") is None for a in accounts)
-    dpd_vision_recommended = scanned and bool(api_key) and has_unread_dpd
+    # Digital reports don't get OCR garble, but a distinct failure mode can
+    # still null max_dpd: PyMuPDF's plain-text reading order can interleave
+    # a dense multi-account page across account boundaries (confirmed on a
+    # real report - one block's text span held three other accounts' full
+    # header+grid content), which _dpd_span_contaminated proves via two
+    # different real Account # codes in one block. That's worth a Vision
+    # call even on a digital report since the correct grid genuinely exists
+    # on the page image; recommending Vision for every other None on a
+    # digital report (e.g. a legitimately blank new-account grid) would
+    # just re-read the same blank cells for no gain, so that case stays
+    # scanned-only.
+    has_contaminated_dpd  = any(a.get("dpd_block_contaminated") for a in accounts)
+    dpd_vision_recommended = (
+        bool(api_key) and has_unread_dpd and (scanned or has_contaminated_dpd)
+    )
     dpd_vision_used         = False
     dpd_vision_summary      = {"pages_sent": [], "accounts_checked": [], "accounts_patched": []}
     if enrich_dpd and dpd_vision_recommended and page_texts:
@@ -893,6 +1320,8 @@ def _parse_text(text, scanned, page_texts, doc, api_key,
         "dpd_vision_pages":       dpd_vision_summary["pages_sent"],
         "dpd_vision_checked":     dpd_vision_summary["accounts_checked"],
         "dpd_vision_patched":     dpd_vision_summary["accounts_patched"],
+        "dpd_geometry_recovered": geometry_dpd_recovered,
+        "status_geometry_corrected": status_corrected,
         "analysis": {
             "credit_profile_summary": crif_credit_profile_summary(accounts),
             "derog_summary":          crif_derog_summary(accounts),

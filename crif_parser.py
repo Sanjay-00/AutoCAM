@@ -736,7 +736,7 @@ def _payment_history_region(block: str) -> str:
     return region[:end_m.start()] if end_m else region
 
 
-def _extract_max_dpd(block: str):
+def _extract_max_dpd(block: str, pre_scoped: bool = False):
     # DPD grid cells are "NNN/AssetClass" (e.g. 027/XXX). OCR mangles them two ways:
     #   - the days value loses leading zeros, so it can be 1-3 digits ('24/XXX');
     #   - the asset class is mis-read ('027/KXX' for '027/XXX'), so requiring an exact
@@ -744,7 +744,15 @@ def _extract_max_dpd(block: str):
     # Accept a 2-3 LETTER class (covers XXX/STD/SMA/... and garbles like KXX) but
     # reject digit-only tokens ('200/200') and frequency words ('400/Monthly'), which
     # would otherwise fabricate DPD from EMI amounts and '000'→'200' misreads.
-    region = _payment_history_region(block)
+    #
+    # pre_scoped=True skips the "Payment History" label search entirely - for a
+    # block obtained by clipping the PDF to this account's own geometric bounds
+    # (see parser._account_clip_text), the label can legitimately appear AFTER
+    # the grid values in document reading order (confirmed on a real report:
+    # the account's mini-header + grid render before its own field labels in
+    # the content stream), which would make _payment_history_region slice past
+    # all the real data and report a false empty/unreadable region.
+    region = block if pre_scoped else _payment_history_region(block)
     vals   = [
         int(num)
         for num, cls in re.findall(r'(?<!\d)(\d{1,3})\s*/\s*([A-Za-z]{2,3})', region)
@@ -799,7 +807,7 @@ def _cell_to_dpd(token: str):
     return int(days_part)
 
 
-def _extract_dpd_window(block: str):
+def _extract_dpd_window(block: str, pre_scoped: bool = False):
     """
     Reads the payment-history grid in true chronological order
     (most-recent-first) to derive:
@@ -839,8 +847,11 @@ def _extract_dpd_window(block: str):
     Substandard bucket's representative value).
 
     Returns (None, None, None) if no grid data could be read at all.
+
+    pre_scoped=True skips the "Payment History" label search - see
+    _extract_max_dpd's matching note for why a geometry-clipped block needs this.
     """
-    region = _payment_history_region(block)
+    region = block if pre_scoped else _payment_history_region(block)
     year_matches = list(_YEAR_RE.finditer(region))
     if not year_matches:
         # No recognisable year label at all. Mirror _extract_max_dpd's own
@@ -1006,6 +1017,35 @@ def build_positional_dpd(text: str) -> list:
 # ACCOUNT EXTRACTION
 # ─────────────────────────────────────────────────────────────────
 
+_ACCT_NUM_RE = re.compile(r'Account\s*#:\s*([A-Za-z0-9]+)', re.IGNORECASE)
+
+
+def _distinct_real_account_numbers(block: str) -> set:
+    """
+    Real (non-masked) 'Account #:' values found anywhere in this block.
+    Masked placeholders ('xxxx'/'XXXX') are excluded - CRIF masks them
+    identically across genuinely different accounts, so a repeated mask
+    proves nothing either way (see extract_account's own KNOWN GAP note).
+    A real alphanumeric code is unmasked and unique per account; finding
+    two DIFFERENT real codes in one block is unambiguous proof this
+    block's captured text span swallowed more than one account's own
+    header+grid - confirmed on a real report where one account's block
+    literally contained three other accounts' full 'Account Type: ...
+    Account #: <code> ... As on: <date>' sections and grids, a page/column
+    reading-order fault in the underlying PDF text extraction, not merely
+    the milder single-value "sibling DPD" leak this function otherwise
+    can't rule out.
+    """
+    return {
+        m.group(1) for m in _ACCT_NUM_RE.finditer(block)
+        if not re.fullmatch(r'x+', m.group(1), re.IGNORECASE)
+    }
+
+
+def _dpd_span_contaminated(block: str) -> bool:
+    return len(_distinct_real_account_numbers(block)) > 1
+
+
 def extract_account(acct_num: int, block: str,
                     loan_type: str = None, entity: str = None,
                     max_dpd: int = None) -> dict:
@@ -1037,8 +1077,25 @@ def extract_account(acct_num: int, block: str,
     # legitimate case.
     _dpd_candidates = [d for d in (max_dpd, block_dpd, grid_max_alltime) if d is not None]
     combined_dpd = max(_dpd_candidates) if _dpd_candidates else None
+    # Distinct from the KNOWN GAP above: when the block demonstrably holds more
+    # than one account's own header+grid (proven by two different real, unmasked
+    # 'Account #:' codes - not just the ambiguous same-masked-value case), none
+    # of max_dpd/last_reported_dpd/max_dpd_12mo can be trusted as THIS account's
+    # own reading, since any of the three candidate sources above may have
+    # silently picked up a different account's grid entirely. Report unreadable
+    # rather than a plausible-looking but potentially wrong number.
+    dpd_block_contaminated = _dpd_span_contaminated(block)
+    if dpd_block_contaminated:
+        combined_dpd = last_reported_dpd = max_dpd_12mo = None
     return {
         "sr_no":            acct_num,
+        # Internal signal for parser.py's Vision-fallback gate, not shown in
+        # the UI/Excel - distinguishes "unreadable because the block's text
+        # span provably swallowed another account's data" (worth spending a
+        # Vision call to recover, even on a digital report) from an ordinary
+        # blank/garbled grid (recovering that on a digital report would just
+        # re-read the same blank cells Vision has no more insight into).
+        "dpd_block_contaminated": dpd_block_contaminated,
         "date_of_sanction": _extract_date(block),
         "sanction_amount":  _extract_sanction_amt(block),
         "current_balance":  _extract_balance(block),

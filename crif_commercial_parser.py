@@ -487,7 +487,7 @@ _LOAN_TYPE_NORMALIZE = {
 }
 
 
-def _extract_loan_type(block: str) -> str:
+def _extract_loan_type(block: str, pre_context: str = "") -> str:
     # Require a literal colon after 'Type' (the real trade label is always 'Type:').
     # A loose substring match on 'Type' also hits the unrelated 'Type of Relationship'
     # applicant-details header that can precede the real label in the same block.
@@ -526,11 +526,25 @@ def _extract_loan_type(block: str) -> str:
             return replacement
     # Fallback: if what we extracted is clearly OCR noise (too short or a known garbage
     # token like "ppp"), search the full block text for a recognizable loan type phrase.
-    # This recovers cases where column-bleed puts the type text before the "Type:" label.
+    # This recovers cases where column-bleed puts the type text before the "Type:" label
+    # but still within this trade's own captured block.
     if len(val) <= 4 or val.lower() in ('ppp', 'std', 'sma', 'sub', 'dbt', 'los'):
         for pat, replacement in _LOAN_TYPE_NORMALIZE.items():
             if re.search(pat, block, re.IGNORECASE):
                 return replacement
+        # Rarer variant, confirmed on a real report: OCR's reading order put the
+        # type phrase BEFORE the trade's own 'Type:' marker entirely - since the
+        # marker itself is what bounds this trade's block (_TRADE_MARKER_SCANNED
+        # matches "Type:"), that phrase isn't in `block` at all, it's in the
+        # PREVIOUS trade's captured span. pre_context is the caller-supplied text
+        # between this trade's own 'Info. as of: <date>' preamble marker and its
+        # 'Type:' marker - deliberately anchored there (not a fixed char window)
+        # so this can't accidentally reach back into the previous trade's real
+        # field values and misattribute its loan type to this account instead.
+        if pre_context:
+            for pat, replacement in _LOAN_TYPE_NORMALIZE.items():
+                if re.search(pat, pre_context, re.IGNORECASE):
+                    return replacement
         return "Unknown"
     # Fix common OCR character substitutions
     val = re.sub(r'Wenicle|Welnicle|Venicle', 'Vehicle', val, flags=re.IGNORECASE)
@@ -979,7 +993,7 @@ def _extract_suit_filed(block: str) -> bool:
     return val.strip().upper() == 'SUIT FILED'
 
 
-def extract_account(ordinal: int, block: str, scanned: bool = False) -> dict:
+def extract_account(ordinal: int, block: str, scanned: bool = False, pre_context: str = "") -> dict:
     balance = _amount(block, r'Current\s+Balance')
     # Fallback: scanned OCR sometimes can't read the Current Balance field but
     # CAN read Drawing Power (same value for active facilities). Use it when
@@ -1078,7 +1092,7 @@ def extract_account(ordinal: int, block: str, scanned: bool = False) -> dict:
         "overdue":          _amount(clean, r'Amount\s+Overdue'),
         "entity":           _extract_entity(clean),
         "ownership":        _extract_ownership(clean),
-        "type_of_loan":     _extract_loan_type(clean),
+        "type_of_loan":     _extract_loan_type(clean, re.sub(r'__STATUS_(?:ACTIVE|CLOSED)__', '', pre_context)),
         "max_dpd":          max_dpd_val,
         "last_reported_dpd": grid_last_reported if grid_last_reported is not None else current_dpd,
         "max_dpd_12mo":       grid_max_12mo if grid_max_12mo is not None else _extract_max_dpd(clean),
@@ -1197,6 +1211,26 @@ def _is_phantom(a: dict) -> bool:
             and a["current_balance"] == 0 and a["type_of_loan"] in ("Unknown", "NA"))
 
 
+_INFO_AS_OF_RE = re.compile(r'Info\.?\s*as\s*of\s*:?\s*\d{2}-\d{2}-\d{4}', re.IGNORECASE)
+
+
+def _trade_pre_context(text: str, t_start: int) -> str:
+    """
+    Text between this trade's own 'Info. as of: <date>' preamble marker and
+    its 'Type:' marker (t_start) - used only as a narrow, boundary-anchored
+    fallback when _extract_loan_type's own block text turns out to be OCR
+    garbage. Anchored on 'Info. as of:' (confirmed to appear exactly once
+    per trade, right in its own preamble) rather than a fixed char window,
+    so this can't accidentally reach back far enough to pick up the
+    PREVIOUS trade's own real field values. Bounded to a 400-char lookback
+    window so a missing/unreadable marker fails closed (returns "") instead
+    of scanning arbitrarily far back.
+    """
+    window = text[max(0, t_start - 400):t_start]
+    matches = list(_INFO_AS_OF_RE.finditer(window))
+    return window[matches[-1].end():] if matches else ""
+
+
 def _expand_account_blocks(text: str, trade_starts: list, status_map: dict,
                            delinquent_set: set, scanned: bool = False) -> tuple:
     """
@@ -1236,7 +1270,7 @@ def _expand_account_blocks(text: str, trade_starts: list, status_map: dict,
             t_start = trade_starts[ti]
             t_end   = trade_starts[ti + 1] if ti + 1 < len(trade_starts) else len(text)
             blk = text[t_start:t_end]
-            a = extract_account(ordinal, blk, scanned)
+            a = extract_account(ordinal, blk, scanned, _trade_pre_context(text, t_start))
             if not a["ownership"]:
                 a["ownership"] = _ownership_before(text, t_start)
             if ti in status_map:
@@ -1314,7 +1348,7 @@ def parse_crif_commercial(text: str, scanned: bool = False) -> tuple:
     if trade_blocks:
         trade_accounts = []
         for i, ((num, blk), start) in enumerate(zip(trade_blocks, trade_starts)):
-            a = extract_account(num, blk, scanned)
+            a = extract_account(num, blk, scanned, _trade_pre_context(text, start))
             if not a["ownership"]:
                 a["ownership"] = _ownership_before(text, start)
             if i in status_map:

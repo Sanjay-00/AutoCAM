@@ -118,6 +118,7 @@ COLUMNS = [
     ("Type of Loan",       30),
     ("Max DPD",            10),
     ("Status",             24),
+    ("Status (per CIBIL)", 20),
 ]
 
 
@@ -260,6 +261,16 @@ def generate_excel(data: dict) -> bytes:
             flags.append("Suit Filed")
         status_cell = f"{status_raw} ({', '.join(flags)})" if flags else status_raw
 
+        # CRIF Retail digital only - the account's own literal printed sidebar
+        # tag ("Active"/"Closed"), read directly from the PDF independent of
+        # crif_parser's text-derived Status column, so an analyst can see
+        # CRIF's own tag alongside our computed value rather than trust it
+        # blindly. Blank both where the report format doesn't support this
+        # read (Commercial/TU/scanned) and where this specific account's own
+        # tag couldn't be read unambiguously - neither is a "Check CIBIL"
+        # failure needing action, just nothing extra to show.
+        status_per_cibil_cell = acc.get("status_per_cibil") or ""
+
         row_values = [
             acc.get("sr_no", idx + 1),
             date_cell_val,
@@ -272,6 +283,7 @@ def generate_excel(data: dict) -> bytes:
             acc.get("type_of_loan", ""),
             dpd_cell,
             status_cell,
+            status_per_cibil_cell,
         ]
 
         for col_idx, value in enumerate(row_values, 1):
@@ -345,6 +357,12 @@ def generate_excel(data: dict) -> bytes:
                     cell.font = _f(color=status_color, bold=(status_raw == "Active"))
                 cell.alignment = _a("center")
 
+            elif col_idx == 12:   # Status (per CIBIL) - literal sidebar tag
+                cell.fill      = row_bg
+                cell.font      = (_f(italic=True, color="808080") if not value
+                                   else _f(color=STATUS_COLORS.get(value, CLOSED_GREY)))
+                cell.alignment = _a("center")
+
         ws.row_dimensions[row_num].height = 16
 
     # ────────────────────────────────────────
@@ -374,9 +392,10 @@ def generate_excel(data: dict) -> bytes:
     kp_gap_start  = total_row + 1
     ws.row_dimensions[kp_gap_start].height     = 8
     ws.row_dimensions[kp_gap_start + 1].height = 8
+    last_col = get_column_letter(len(COLUMNS))  # keep the KP banner full-width as COLUMNS grows
 
     kp_header_row = kp_gap_start + 2
-    ws.merge_cells(f"A{kp_header_row}:K{kp_header_row}")
+    ws.merge_cells(f"A{kp_header_row}:{last_col}{kp_header_row}")
     kp_hdr = ws.cell(row=kp_header_row, column=1,
                      value="Key Points for Loan Decision:")
     kp_hdr.font      = _f(size=12, bold=True, underline="single", color=NAVY)
@@ -386,7 +405,7 @@ def generate_excel(data: dict) -> bytes:
 
     for i, point in enumerate(key_points):
         pr = kp_header_row + 1 + i
-        ws.merge_cells(f"A{pr}:K{pr}")
+        ws.merge_cells(f"A{pr}:{last_col}{pr}")
         kp_cell = ws.cell(row=pr, column=1, value=f"  {i+1}. {point}")
         kp_cell.font      = _f(size=10)
         kp_cell.fill      = _fill(KP_BG)
