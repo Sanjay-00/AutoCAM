@@ -50,6 +50,17 @@ def extract_name(text: str) -> str:
 # header field, not the later "DOB Variations" / "Phone Variations" tables
 # (multiple candidate values, no way to know which is current).
 _PAN_RE = re.compile(r'([A-Z]{5}\d{4}[A-Z])\s*\[PAN\]')
+# CRIF Commercial prints the borrower's own PAN as a plain "PAN:" label inside
+# the Borrower Details header and tags nobody there with [PAN]; the [PAN] tags
+# appear further down, on the directors and shareholders in Relationship
+# Details. So the rule above, which is correct for a Retail report, picks the
+# first director it meets. Seen on a real Commercial report for a company
+# borrower: the header read "PAN: <company PAN>" and the [PAN] search
+# returned a shareholder's PAN instead. The labelled header is tried first
+# and the [PAN] tag remains the Retail path.
+_BORROWER_PAN_RE = re.compile(
+    r'Borrower\s+Details.*?\bPAN:\s*([A-Z]{5}\d{4}[A-Z])', re.S
+)
 _DOB_RE = re.compile(r'DOB/Age:\s*(\d{2}-\d{2}-\d{4})')
 _PHONE_RE = re.compile(r'Phone\s*Numbers?:\s*(\+?\d[\d\s]{7,14}\d)')
 
@@ -60,7 +71,7 @@ def extract_borrower_identity(text: str) -> dict:
     specific, labelled format only - a miss returns None rather than a
     wrong value, same never-guess contract as extract_name.
     """
-    pan_match = _PAN_RE.search(text)
+    pan_match = _BORROWER_PAN_RE.search(text) or _PAN_RE.search(text)
     dob_match = _DOB_RE.search(text)
     phone_match = _PHONE_RE.search(text)
     return {
