@@ -1088,6 +1088,12 @@ def extract_account(acct_num: int, block: str,
     # legitimate case.
     _dpd_candidates = [d for d in (max_dpd, block_dpd, grid_max_alltime) if d is not None]
     combined_dpd = max(_dpd_candidates) if _dpd_candidates else None
+    # The KNOWN GAP above cannot be detected, but its precondition can: the
+    # readings disagree, and max() picked the highest. Surfaced, not
+    # resolved, so a caller can ask a human to confirm the figure against
+    # the report before relying on it. A genuine re-reported account also
+    # disagrees; confirming it costs a glance, never a wrong number.
+    dpd_sources_disagree = len(set(_dpd_candidates)) > 1
     # Distinct from the KNOWN GAP above: when the block demonstrably holds more
     # than one account's own header+grid (proven by two different real, unmasked
     # 'Account #:' codes - not just the ambiguous same-masked-value case), none
@@ -1107,6 +1113,9 @@ def extract_account(acct_num: int, block: str,
         # blank/garbled grid (recovering that on a digital report would just
         # re-read the same blank cells Vision has no more insight into).
         "dpd_block_contaminated": dpd_block_contaminated,
+        # Internal signal too: the DPD readings behind max_dpd disagreed, so
+        # max_dpd may carry a neighbouring account's worse figure.
+        "dpd_sources_disagree": dpd_sources_disagree and not dpd_block_contaminated,
         "date_of_sanction": _extract_date(block),
         "sanction_amount":  _extract_sanction_amt(block),
         "current_balance":  _extract_balance(block),
